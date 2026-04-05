@@ -1,0 +1,291 @@
+---
+title: "Service management"
+description: "Manage systemd services with systemctl: start, stop, enable, and inspect units, understand service states, and configure unit file directives."
+---
+
+`systemctl` is the primary command-line tool for interacting with the systemd service manager. It communicates with systemd over D-Bus and can start, stop, enable, disable, and inspect units.
+
+## systemctl commands
+
+### Runtime control
+
+These commands affect the currently running system but do not persist across reboots.
+
+| Command | Description |
+|---------|-------------|
+| `systemctl start <unit>` | Start a unit immediately. |
+| `systemctl stop <unit>` | Stop a unit. |
+| `systemctl restart <unit>` | Stop, then start a unit. |
+| `systemctl reload <unit>` | Ask the unit to reload its configuration without restarting the process. Only works if the service supports it. |
+| `systemctl kill <unit>` | Send a signal to the unit's processes. Defaults to `SIGTERM`. |
+
+### Enablement
+
+These commands control whether a unit starts automatically at boot by creating or removing symlinks in `/etc/systemd/system/`.
+
+| Command | Description |
+|---------|-------------|
+| `systemctl enable <unit>` | Enable a unit to start at boot. |
+| `systemctl disable <unit>` | Disable a unit from starting at boot. |
+| `systemctl enable --now <unit>` | Enable and immediately start a unit. |
+| `systemctl disable --now <unit>` | Disable and immediately stop a unit. |
+| `systemctl mask <unit>` | Prevent a unit from being started by any means, including as a dependency of another unit. Creates a symlink to `/dev/null`. |
+| `systemctl unmask <unit>` | Remove a mask, restoring the unit to its normal state. |
+
+<Warning>
+`systemctl mask` is stronger than `disable`. A masked unit cannot be started even as a dependency. Use it only when you want to permanently block a unit from running on a system.
+</Warning>
+
+### Inspection
+
+| Command | Description |
+|---------|-------------|
+| `systemctl status <unit>` | Show the current state, recent log output, and process info for a unit. |
+| `systemctl list-units` | List all currently loaded units and their state. |
+| `systemctl list-unit-files` | List installed unit files and their enablement state. |
+| `systemctl is-active <unit>` | Print `active` or `inactive`; exits 0 if active. |
+| `systemctl is-enabled <unit>` | Print the enablement state; exits 0 if enabled. |
+| `systemctl is-failed <unit>` | Print `failed` or `active`; exits 0 if failed. |
+| `systemctl cat <unit>` | Print the full unit file as loaded, including all drop-ins. |
+| `systemctl show <unit>` | Print all properties of a unit in key=value format. |
+
+### systemctl status output
+
+Running `systemctl status nginx.service` produces output similar to:
+
+```
+● nginx.service - The NGINX HTTP and reverse proxy server
+     Loaded: loaded (/usr/lib/systemd/system/nginx.service; enabled; preset: disabled)
+     Active: active (running) since Mon 2026-04-05 10:22:15 UTC; 3h 14min ago
+    Process: 1234 ExecStartPre=/usr/bin/nginx -t (code=exited, status=0/SUCCESS)
+   Main PID: 1238 (nginx)
+      Tasks: 3 (limit: 4680)
+     Memory: 6.2M (peak: 8.1M)
+        CPU: 412ms
+     CGroup: /system.slice/nginx.service
+             ├─1238 "nginx: master process /usr/bin/nginx"
+             ├─1239 "nginx: worker process"
+             └─1240 "nginx: worker process"
+
+Apr 05 10:22:15 hostname systemd[1]: Starting The NGINX HTTP and reverse proxy server...
+Apr 05 10:22:15 hostname systemd[1]: Started The NGINX HTTP and reverse proxy server.
+```
+
+The output shows:
+- **Loaded**: where the unit file was found and its enablement state
+- **Active**: the current active state and how long the unit has been in that state
+- **Main PID**: the primary process ID
+- **CGroup**: the cgroup the unit's processes are assigned to
+- Recent journal entries for the unit
+
+## Service states
+
+A unit's state is the combination of its **load state** (whether the file was parsed successfully) and its **active state** (whether the unit is running).
+
+| Active state | Description |
+|--------------|-------------|
+| `active` | The unit is running normally. For a service, the main process is alive. |
+| `inactive` | The unit is stopped. It has either never been started or was stopped cleanly. |
+| `failed` | The unit encountered an error — the process exited with a non-zero code, crashed, timed out, or hit a resource limit. |
+| `activating` | The unit is in the process of starting up. |
+| `deactivating` | The unit is in the process of shutting down. |
+| `maintenance` | The unit is stopped and marked as needing attention (similar to failed). |
+
+Use `systemctl --failed` to list all units currently in the failed state.
+
+## Unit file sections
+
+A service unit file is divided into three sections.
+
+### [Unit]
+
+Common to all unit types. Contains metadata and dependency declarations.
+
+```ini
+[Unit]
+Description=Human-readable description of what this unit does
+Documentation=https://example.com/docs man:myapp(8)
+After=network.target
+Wants=network.target
+```
+
+### [Service]
+
+Service-specific configuration, including how to start and stop the process, and how to handle failures.
+
+```ini
+[Service]
+Type=exec
+ExecStart=/usr/bin/myapp --foreground
+ExecStop=/usr/bin/myapp --shutdown
+Restart=on-failure
+RestartSec=5s
+User=myapp
+Group=myapp
+WorkingDirectory=/var/lib/myapp
+```
+
+### [Install]
+
+Controls the behavior of `systemctl enable` and `systemctl disable`. systemd ignores this section during normal operation; it is only read by `systemctl`.
+
+```ini
+[Install]
+WantedBy=multi-user.target
+```
+
+`WantedBy=multi-user.target` causes `systemctl enable` to create a symlink in `/etc/systemd/system/multi-user.target.wants/`, which makes the service start whenever `multi-user.target` is reached.
+
+## Service types
+
+The `Type=` directive in `[Service]` tells systemd how the service signals that it has finished starting up. Choosing the right type ensures that dependent services start only after this service is fully ready.
+
+<AccordionGroup>
+  <Accordion title="Type=simple (default)">
+    The service manager considers the unit started immediately after `fork()`, before the process has called `execve()`. systemd proceeds to start dependencies right away without waiting for the service to be ready.
+
+    ```ini
+    [Service]
+    Type=simple
+    ExecStart=/usr/bin/myapp
+    ```
+
+    Use `Type=exec` instead when you want the manager to wait until the binary has actually been executed.
+  </Accordion>
+  <Accordion title="Type=exec">
+    Like `simple`, but the manager waits until `execve()` has succeeded before starting dependent units. If the binary cannot be found or executed, `systemctl start` reports failure immediately. Preferred over `simple` for most services.
+
+    ```ini
+    [Service]
+    Type=exec
+    ExecStart=/usr/bin/myapp
+    ```
+  </Accordion>
+  <Accordion title="Type=forking">
+    The service forks a child process and the parent exits. The child becomes the main service process. Use `PIDFile=` with this type so systemd can track the child. This is the traditional UNIX daemon pattern; its use is discouraged for new services — prefer `Type=notify` instead.
+
+    ```ini
+    [Service]
+    Type=forking
+    PIDFile=/run/myapp/myapp.pid
+    ExecStart=/usr/sbin/myapp -d
+    ```
+  </Accordion>
+  <Accordion title="Type=oneshot">
+    The service runs a single short-lived process and is considered started only after that process exits. Used for tasks like running a setup script. Combine with `RemainAfterExit=yes` if you want the unit to appear active after the command finishes.
+
+    ```ini
+    [Service]
+    Type=oneshot
+    ExecStart=/usr/bin/setup-db.sh
+    RemainAfterExit=yes
+    ```
+  </Accordion>
+  <Accordion title="Type=notify">
+    The service sends a notification via `sd_notify(3)` when it is ready. systemd waits for this notification before starting dependent units. This is the recommended type for new daemons that can be modified to send the notification.
+
+    ```ini
+    [Service]
+    Type=notify
+    ExecStart=/usr/bin/myapp
+    ```
+  </Accordion>
+  <Accordion title="Type=dbus">
+    The service is considered ready when it acquires the D-Bus bus name specified in `BusName=`. Used for services that register on the system bus.
+
+    ```ini
+    [Service]
+    Type=dbus
+    BusName=org.example.MyApp
+    ExecStart=/usr/bin/myapp
+    ```
+  </Accordion>
+  <Accordion title="Type=idle">
+    Like `simple`, but the service binary is executed only after all active jobs have been dispatched. Useful for services that should not compete with other startup activity (for example, progress bars or status messages during boot).
+  </Accordion>
+</AccordionGroup>
+
+## Key [Service] directives
+
+| Directive | Description |
+|-----------|-------------|
+| `ExecStart=` | The command to run when the service starts. Required for most service types. |
+| `ExecStop=` | The command to run when the service stops. If not set, systemd sends `SIGTERM` to the main process. |
+| `ExecReload=` | The command to run when `systemctl reload` is called. |
+| `ExecStartPre=` | Commands to run before `ExecStart=`. If any fail, the service does not start. |
+| `ExecStartPost=` | Commands to run after `ExecStart=` succeeds. |
+| `Restart=` | When to automatically restart the service. Common values: `no`, `on-failure`, `on-abnormal`, `always`. |
+| `RestartSec=` | Time to wait between automatic restarts. |
+| `User=` | Run the service as this user. |
+| `Group=` | Run the service under this group. |
+| `WorkingDirectory=` | Set the working directory for the service processes. |
+| `Environment=` | Set environment variables for the service. |
+| `EnvironmentFile=` | Read environment variables from a file. |
+| `StandardOutput=` | Where to send stdout. Defaults to `journal`. |
+
+## Enabling and starting a new service
+
+<Steps>
+  <Step title="Write the unit file">
+    Create the unit file at `/etc/systemd/system/myapp.service`:
+
+    ```ini
+    [Unit]
+    Description=My Application
+    After=network.target
+
+    [Service]
+    Type=exec
+    ExecStart=/usr/bin/myapp
+    Restart=on-failure
+    User=myapp
+
+    [Install]
+    WantedBy=multi-user.target
+    ```
+  </Step>
+  <Step title="Reload the systemd manager">
+    After creating or modifying a unit file, tell systemd to re-read its configuration:
+
+    ```bash
+    systemctl daemon-reload
+    ```
+  </Step>
+  <Step title="Enable the service">
+    Create the boot-time symlink so the service starts automatically:
+
+    ```bash
+    systemctl enable myapp.service
+    ```
+  </Step>
+  <Step title="Start the service">
+    Start the service immediately without waiting for the next reboot:
+
+    ```bash
+    systemctl start myapp.service
+    ```
+
+    Or combine the previous two steps into one:
+
+    ```bash
+    systemctl enable --now myapp.service
+    ```
+  </Step>
+  <Step title="Verify it is running">
+    Check the service status and confirm it is active:
+
+    ```bash
+    systemctl status myapp.service
+    ```
+
+    If the service failed to start, check the logs:
+
+    ```bash
+    journalctl -u myapp.service -n 50
+    ```
+  </Step>
+</Steps>
+
+<Tip>
+Use `systemctl edit myapp.service` to create a drop-in override without modifying the original unit file. systemd will open an editor and save your changes to `/etc/systemd/system/myapp.service.d/override.conf`, which persists across package updates.
+</Tip>

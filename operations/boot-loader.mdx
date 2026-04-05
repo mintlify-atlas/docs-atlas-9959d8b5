@@ -1,0 +1,210 @@
+---
+title: "systemd-boot"
+description: "Install and configure systemd-boot, the UEFI boot manager included with systemd. Manage boot entries, loader.conf options, and EFI variables with bootctl."
+---
+
+systemd-boot is a UEFI boot manager that executes configured EFI images. It reads boot entry files from the EFI System Partition (ESP) and presents an on-screen menu when a key is pressed during startup. If no key is pressed and no timeout is configured, it boots the default entry immediately.
+
+<Note>
+  systemd-boot operates exclusively on the EFI System Partition. All configuration files, kernels, and initrds must reside on the ESP. Linux kernels must be built with `CONFIG_EFI_STUB` to be directly executable as EFI images.
+</Note>
+
+---
+
+## Installation
+
+<Steps>
+  <Step title="Install systemd-boot to the ESP">
+    ```bash
+    bootctl install
+    ```
+    This copies the systemd-boot EFI binary to the ESP and registers it with the firmware as a boot option. The ESP is typically mounted at `/boot` or `/boot/efi`.
+  </Step>
+  <Step title="Verify the installation">
+    ```bash
+    bootctl status
+    ```
+    Shows firmware details, the active boot loader, available loaders on the ESP, the firmware's boot order, and the current default entry.
+  </Step>
+  <Step title="Update after a systemd upgrade">
+    ```bash
+    bootctl update
+    ```
+    Copies the current version of the systemd-boot EFI binary to the ESP, replacing the previous version. Run this after upgrading the `systemd` package.
+  </Step>
+</Steps>
+
+---
+
+## loader.conf
+
+The main configuration file is located at `<ESP>/loader/loader.conf`. It controls the menu timeout, the default entry, the console mode, and Secure Boot behavior.
+
+```ini
+# /boot/loader/loader.conf
+timeout 3
+default fedora-*
+console-mode auto
+editor no
+```
+
+### Key options
+
+| Option | Description |
+|---|---|
+| `default` | Glob pattern selecting the default entry by filename (without path). Set to `@saved` to remember the last selection across boots. |
+| `timeout` | Seconds to display the menu. Set to `0` to skip the menu unless a key is pressed. |
+| `console-mode` | EFI console resolution. Values: `0` (80×25), `1` (80×50), `2` (highest available), `auto` (pick highest without changing mode), `max`, `keep`. |
+| `editor` | Whether to allow kernel command-line editing in the menu. Set to `no` on security-sensitive systems. |
+| `auto-entries` | Whether to include automatically detected entries (Type 2 UKIs, Windows, EFI shell). Default: `yes`. |
+| `auto-firmware` | Whether to include a "Reboot into firmware" entry. Default: `yes`. |
+| `beep` | Play an audible beep when the menu is shown. Default: `no`. |
+| `reboot-for-bitlocker` | Indicate to the firmware that the next reboot should suspend BitLocker. Default: `no`. |
+| `secure-boot-enroll` | Control automatic Secure Boot key enrollment. Values: `off`, `manual`, `if-safe`, `force`. |
+
+---
+
+## Boot entry files (Type 1)
+
+Each boot entry is a `.conf` file under `<ESP>/loader/entries/`. The filename (without `.conf`) is the entry ID used by `bootctl set-default` and the `default=` glob pattern.
+
+```ini
+# /boot/loader/entries/fedora-6.8.0.conf
+title      Fedora Linux 40
+version    6.8.0-300.fc40.x86_64
+machine-id 6a9857a393724b7a981ebb5b8495b9ea
+linux      /6a9857a393724b7a981ebb5b8495b9ea/6.8.0-300.fc40.x86_64/linux
+initrd     /6a9857a393724b7a981ebb5b8495b9ea/6.8.0-300.fc40.x86_64/initrd
+options    root=UUID=f8f83f73-df71-445c-87f7-31f70263b83b quiet rw
+```
+
+### Entry keywords
+
+| Keyword | Description |
+|---|---|
+| `title` | Text displayed in the boot menu. |
+| `version` | Version string appended to the title when multiple entries share the same title. |
+| `machine-id` | Machine identifier appended to the title to make it unique. |
+| `linux` | Path to the Linux kernel EFI stub image, relative to the ESP root. |
+| `initrd` | Path to an initramfs image. May appear multiple times (e.g., for microcode and the main initrd). |
+| `efi` | Path to an arbitrary EFI executable (for non-Linux entries). |
+| `options` | Kernel command line or EFI image options. |
+
+### Custom kernel entry example
+
+```ini
+# /boot/loader/entries/custom-kernel.conf
+title      My kernel with initrd
+linux      /bzImage
+initrd     /initrd.img
+options    root=PARTUUID=084917b7-8be2-4e86-838d-f771a9902e08 quiet
+```
+
+---
+
+## Automatic entry detection
+
+systemd-boot detects two types of entries defined by the [Boot Loader Specification](https://uapi-group.org/specifications/specs/boot_loader_specification/):
+
+<CardGroup cols={2}>
+  <Card title="Type 1 entries" icon="file">
+    Plain `.conf` files in `<ESP>/loader/entries/` and `<XBOOTLDR>/loader/entries/`. These are the manually written files described above.
+  </Card>
+  <Card title="Type 2 entries (UKIs)" icon="cube">
+    Unified Kernel Images (`.efi` files) located in `<ESP>/EFI/Linux/` or `<XBOOTLDR>/EFI/Linux/`. These bundle the kernel, initrd, and cmdline into a single signed EFI binary. systemd-boot discovers them automatically.
+  </Card>
+</CardGroup>
+
+Additionally, systemd-boot auto-generates entries for the EFI Default Loader, EFI Shell, Windows Boot Manager, and macOS, if present.
+
+---
+
+## Managing boot entries with bootctl
+
+```bash
+# List all available boot entries
+bootctl list
+
+# Set the default entry for all future boots
+bootctl set-default fedora-6.8.0.conf
+
+# Set the default entry for the next boot only
+bootctl set-oneshot fedora-6.8.0-rescue.conf
+
+# Set the entry to boot on system failure
+bootctl set-sysfail recovery.conf
+
+# Remove an entry and its referenced files
+bootctl unlink fedora-6.8.0.conf
+
+# Remove orphaned files from the ESP
+bootctl cleanup
+```
+
+<Tip>
+  Use `bootctl set-oneshot` to test a new kernel entry without making it permanent. If the system boots successfully, promote it with `bootctl set-default`.
+</Tip>
+
+---
+
+## EFI variables
+
+systemd-boot communicates with the running OS through EFI variables under vendor UUID `4a67b082-0a4c-41cf-b6c7-440b29bb8c4f`. These variables persist across reboots in NVRAM.
+
+| Variable | Volatility | Description |
+|---|---|---|
+| `LoaderEntryDefault` | Non-volatile | Entry identifier to use as default at boot, ignoring boot assessment. |
+| `LoaderEntryPreferred` | Non-volatile | Default entry, respecting boot assessment (tries-left counter). |
+| `LoaderEntryOneShot` | Non-volatile | Entry to use for the next boot only; cleared after use. |
+| `LoaderConfigTimeout` | Non-volatile | Menu timeout in seconds, overrides `timeout=` in `loader.conf`. |
+| `LoaderDevicePartUUID` | Volatile | GPT partition UUID of the ESP that systemd-boot was loaded from. |
+| `LoaderSysFailReason` | Volatile | System failure reason string, set on abnormal boot. |
+
+`bootctl status` displays the current values. You can also reboot directly into firmware setup:
+
+```bash
+bootctl reboot-to-firmware yes
+# or equivalently:
+systemctl reboot --firmware-setup
+```
+
+---
+
+## Secure Boot
+
+systemd-boot supports Secure Boot and can enroll keys automatically. Set the `secure-boot-enroll=` option in `loader.conf`:
+
+```ini
+secure-boot-enroll if-safe
+```
+
+| Value | Behavior |
+|---|---|
+| `off` | No automatic enrollment. |
+| `manual` | Show the enrollment option in the menu but do not enroll automatically. |
+| `if-safe` | Enroll automatically if the firmware is in Setup Mode and no third-party keys are present. |
+| `force` | Always enroll, even if existing keys would be replaced. |
+
+<Warning>
+  Using `secure-boot-enroll force` can make the system unbootable if the enrolled keys do not cover all binaries in the boot chain. Prefer `if-safe` or `manual` unless you fully control the key set.
+</Warning>
+
+---
+
+## Menu keyboard shortcuts
+
+While the boot menu is displayed, the following keys are active:
+
+| Key | Action |
+|---|---|
+| Up / Down | Select entry |
+| Enter | Boot selected entry |
+| `d` | Set selected entry as default (stored in EFI variable) |
+| `t` / `T` | Increase / decrease timeout |
+| `e` | Edit kernel command line for this boot only |
+| `v` | Show systemd-boot and UEFI version |
+| `P` | Print current configuration to console |
+| `Q` | Quit the menu |
+| `h` | Show key mapping help |
+| `l` / `w` / `a` / `s` | Quick-boot Linux / Windows / macOS / EFI Shell |
+| `1`–`9` | Quick-boot entry by number |

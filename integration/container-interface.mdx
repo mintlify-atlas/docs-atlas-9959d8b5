@@ -1,0 +1,284 @@
+---
+title: "Container and VM Interface"
+description: "How to integrate a container or VM manager with systemd: environment variables, cgroup delegation, the /run/host/ hierarchy, machined registration, and the sd_notify passthrough socket."
+---
+
+systemd defines a set of interfaces for container and VM managers to use when systemd runs as PID 1 inside a managed environment. These interfaces allow the container manager to control the guest's behavior, report host metadata, pass credentials, and track the guest's lifecycle.
+
+<Note>
+This page covers the guest-facing and host-facing interfaces for container and VM managers. For the complementary perspective — how the host OS integrates with VM and container managers — see the machined D-Bus API documentation.
+</Note>
+
+## Detecting the container environment
+
+When systemd detects it is running inside a container, it adjusts its behavior accordingly: it skips hardware-specific initialization, runs a single console getty instead of VT management, and suppresses udev.
+
+The detection mechanism relies on the `$container` environment variable being set for PID 1. **Always set this variable.** Without it, `ConditionVirtualization=` in unit files will not work correctly.
+
+```bash
+# Set before exec'ing systemd as PID 1 in the container
+container=myruntime
+```
+
+The value must be a short lowercase string identifying the container manager implementation. Examples: `lxc`, `lxc-libvirt`, `systemd-nspawn`, `docker`, `podman`.
+
+### Checking from inside the container
+
+Code inside the container that wants to detect virtualization should read `/proc/1/environ` and look for `container=`. This file is root-readable only. systemd also writes the value to `/run/systemd/container` early in boot, which is world-readable — however this is a systemd-specific path and may not exist under other init systems.
+
+The recommended tool for this check is `systemd-detect-virt`:
+
+```bash
+systemd-detect-virt --container   # prints container type, exits 0 if in a container
+systemd-detect-virt --vm           # prints VM type, exits 0 if in a VM
+systemd-detect-virt -q && echo "running in a virtualized environment"
+```
+
+## Environment variables for PID 1
+
+These variables should be set in the environment of the container's PID 1 (i.e. systemd itself) before exec.
+
+| Variable | Purpose |
+|---|---|
+| `container` | Short string identifying the container runtime (required) |
+| `container_uuid` | UUID for `/etc/machine-id` initialization. Passed only when `/etc/machine-id` is empty. Must be unique per running instance. |
+| `container_ttys` | Space-separated list of pty names (e.g. `pts/7 pts/8`) on which to spawn login gettys |
+| `container_host_id` | Host OS identifier from `/etc/os-release` (`ID` field) |
+| `container_host_version_id` | Host OS version from `/etc/os-release` (`VERSION_ID` field) |
+| `container_host_build_id` | Host build ID from `/etc/os-release` |
+| `container_host_variant_id` | Host variant from `/etc/os-release` |
+| `CREDENTIALS_DIRECTORY` | Absolute path to a read-only directory of credential blobs to pass to the service manager |
+| `NOTIFY_SOCKET` | Path to a socket where the container's systemd sends `sd_notify()` messages |
+
+### Machine UUID
+
+```bash
+# Pass a UUID to initialize /etc/machine-id (only works when /etc/machine-id is empty)
+container_uuid=550e8400-e29b-41d4-a716-446655440000
+```
+
+systemd will persist the UUID to `/etc/machine-id` on first boot if the file is writable. Always pass the same UUID for a given container instance, and generate a fresh UUID for cloned containers.
+
+## Execution environment setup
+
+The container manager is responsible for preparing the filesystem namespace before invoking systemd as PID 1. The following requirements are non-negotiable for a working systemd:
+
+<Steps>
+  <Step title="Pre-mount /proc, /sys, and /dev">
+    Mount `/proc/` and `/sys/` before starting systemd. Mount `/sys/` read-only — this is the signal systemd uses to determine it is in a container (which suppresses udev and device management).
+
+    ```bash
+    mount -t proc proc /proc
+    mount -t sysfs sysfs /sys -o ro
+    mount -t tmpfs tmpfs /dev
+    ```
+
+    If the container has network namespaces, `/proc/sys/net/` may be left writable. If it has full namespace isolation (user, ipc, uts, pid, net), the entire `/proc/sys` can be writable — but ensure an appropriate user namespace mapping exists.
+  </Step>
+  <Step title="Set up /dev">
+    `/dev/` should be a private `tmpfs`. Bind mount a pty as `/dev/console`. Create device nodes for:
+    - `/dev/null`, `/dev/zero`, `/dev/full`
+    - `/dev/random`, `/dev/urandom`
+    - `/dev/tty`, `/dev/ptmx`
+
+    Do not drop `CAP_MKNOD` — many systemd services use `PrivateDevices=`, which requires creating device nodes inside a private `/dev/`.
+  </Step>
+  <Step title="Configure cgroup delegation">
+    Run the container as a systemd service or scope unit with `Delegate=yes`. This places the container in a sub-tree of the cgroup hierarchy where systemd in the container can freely manage its own cgroups.
+
+    ```bash
+    # Create a scope for the container via systemd-run
+    systemd-run --scope --unit=mycontainer -p Delegate=yes \
+        -- /usr/bin/myruntime start mycontainer
+    ```
+
+    Do not add cgroup directories outside the delegated sub-tree.
+  </Step>
+  <Step title="Set mount propagation to MS_SHARED">
+    The mount hierarchy must be `MS_SHARED` before systemd starts. It may be `MS_PRIVATE` or `MS_SLAVE` initially, but must be remounted `MS_SHARED` before exec.
+  </Step>
+</Steps>
+
+<Warning>
+Do not mount only a sub-tree of cgroupfs into the container. `/proc/$PID/cgroup` reports full paths and cannot be matched against a partial view of the cgroup tree.
+</Warning>
+
+## The /run/host/ hierarchy
+
+The container manager can expose information and resources to the container payload by placing them under `/run/host/`. This directory should be mostly read-only from inside the container.
+
+| Path | Contents |
+|---|---|
+| `/run/host/os-release` | Copy of the host's `/etc/os-release` — allows payload to identify the host OS |
+| `/run/host/container-manager` | Same string as `$container` — readable by unprivileged users without access to PID 1's environment |
+| `/run/host/container-uuid` | Same value as `$container_uuid` |
+| `/run/host/credentials/` | Recommended location for credentials passed via `$CREDENTIALS_DIRECTORY` |
+| `/run/host/notify` | Recommended path for the `sd_notify()` passthrough socket (see below) |
+| `/run/host/incoming/` | Mount point for `machinectl bind` — configured `MS_SLAVE` for host-to-container mount propagation |
+| `/run/host/inaccessible/` | Six inaccessible file nodes (`reg`, `dir`, `fifo`, `sock`, `chr`, `blk`) used to implement `InaccessiblePaths=` |
+| `/run/host/unix-export/` | Writable from the container; `AF_UNIX` sockets bound here are accessible from the host |
+| `/run/host/unix-export/ssh` | Automatically bound by `systemd-ssh-generator` for SSH access into the container |
+| `/run/host/userdb/` | JSON user records for `nss-systemd` inside the container |
+| `/run/host/home/` | Host home directories bind-mounted for container user access |
+
+### Host OS release information
+
+```bash
+# Read from inside the container:
+cat /run/host/os-release
+# ID=fedora
+# VERSION_ID=40
+# ...
+```
+
+This lets container payload identify what distribution the host is running, without needing to query the host directly.
+
+## Readiness notification passthrough
+
+systemd inside the container can report boot completion and system status to the container manager using the `sd_notify()` protocol. Set `$NOTIFY_SOCKET` in PID 1's environment to a socket path the container manager controls:
+
+```bash
+# Manager opens socket, passes path to container's PID 1
+NOTIFY_SOCKET=/run/host/notify
+```
+
+The container's systemd sends messages like:
+
+- `READY=1` — boot is complete, all default services are up
+- `STATUS=Starting up...` — boot progress
+- `X_SYSTEMD_SIGNALS_LEVEL=2` — extended signal handlers (SIGRTMIN+3) are installed
+
+Once `X_SYSTEMD_SIGNALS_LEVEL=2` is received, the manager can send `SIGRTMIN+3` to the container's PID 1 to trigger a clean shutdown. Do not send this signal before receiving that notification.
+
+```bash
+# Trigger clean container shutdown
+kill -SIGRTMIN+3 <container_pid1>
+```
+
+## Socket activation for containers
+
+A container manager that runs as a systemd service can receive socket-activated file descriptors and pass them through to the container's init process. This enables socket-activated containers:
+
+```bash
+# The manager receives sockets in $LISTEN_FDS starting at fd 3.
+# It passes them to the container's PID 1 by:
+# 1. Leaving the file descriptors open (do not close them)
+# 2. Setting LISTEN_FDS to the same count
+# 3. Setting LISTEN_PID to the container's PID 1 (not the manager's PID)
+```
+
+The container's systemd then handles the sockets as if it had opened them itself and activates services accordingly.
+
+## Registering with systemd-machined
+
+All containers and VMs should register with `systemd-machined` to appear in systemd tooling. Registration provides:
+
+- Process attribution: `ps`, `systemctl`, and `journalctl` can show which machine each process belongs to
+- `-M` flag support: `systemctl -M mycontainer status`, `journalctl -M mycontainer`
+- Interactive shell: `machinectl shell mycontainer`
+
+### D-Bus API: org.freedesktop.machine1
+
+Register via the `CreateMachine()` method on the `org.freedesktop.machine1.Manager` interface:
+
+```
+bus name:    org.freedesktop.machine1
+object path: /org/freedesktop/machine1
+interface:   org.freedesktop.machine1.Manager
+method:      CreateMachine(name, id, service, class, leader, root_directory, scope_properties)
+```
+
+| Parameter | Description |
+|---|---|
+| `name` | Machine name (must be valid hostname) |
+| `id` | Machine UUID as 16-byte array (or all-zeros) |
+| `service` | Container manager identifier string (e.g. `"systemd-nspawn"`) |
+| `class` | `"container"` or `"vm"` |
+| `leader` | PID of the container's init process |
+| `root_directory` | Absolute path to the container's root filesystem |
+| `scope_properties` | Additional unit properties for the scope (e.g. `Delegate=yes`) |
+
+`CreateMachine()` automatically places the container's processes into a systemd scope unit under `machines.slice`.
+
+### machinectl commands
+
+```bash
+# List running machines
+machinectl list
+
+# Show detailed status
+machinectl status mycontainer
+
+# Open an interactive shell inside the container
+machinectl shell mycontainer
+
+# Open a login prompt
+machinectl login mycontainer
+
+# Copy files into the container
+machinectl copy-to mycontainer /etc/hosts /etc/hosts
+
+# Copy files out of the container
+machinectl copy-from mycontainer /var/log/app.log ./app.log
+
+# Bind mount a host path into the container
+machinectl bind mycontainer /var/data /var/data
+
+# Stop the container cleanly
+machinectl stop mycontainer
+
+# Power off
+machinectl poweroff mycontainer
+```
+
+## Networking recommendations
+
+- Inside the container, a `veth` interface named `host0` will automatically be configured with DHCPv4, DHCPv6, and IPv4LL by `systemd-networkd`.
+- Outside the container, a `veth` interface prefixed `ve-` (e.g. `ve-mycontainer`) will be configured as a DHCP server by `systemd-networkd`.
+- Use stable MAC addresses for container veth devices, for example hashed from the container name, to get stable DHCP leases.
+
+## Journal integration
+
+Link the container's journal directory into the host journal directory so that `journalctl -m` displays all container logs interleaved:
+
+```bash
+# From the host
+ln -s /var/lib/machines/mycontainer/var/log/journal/<machine-id> \
+      /var/log/journal/<machine-id>
+```
+
+The machine ID is found in `/etc/machine-id` inside the container.
+
+## What not to do
+
+<AccordionGroup>
+  <Accordion title="Do not drop CAP_MKNOD">
+    `PrivateDevices=` is a widely-used service setting that requires `CAP_MKNOD` to create device nodes inside a private `/dev/`. Dropping it breaks all services that set this flag. Use `BPF_PROG_TYPE_CGROUP_DEVICE` programs or the `devices` cgroup controller to restrict device access instead.
+  </Accordion>
+  <Accordion title="Do not drop CAP_SYS_ADMIN">
+    `PrivateDevices=`, `ProtectHome=`, `ProtectSystem=`, `PrivateTmp=`, and related settings all require mount namespace operations. Dropping `CAP_SYS_ADMIN` breaks every service that uses these settings, including most of systemd's own services. logind also requires it to mount `XDG_RUNTIME_DIR` as `tmpfs`.
+  </Accordion>
+  <Accordion title="Do not make /sys writable">
+    A writable `/sys/` causes systemd to start `systemd-udevd`, which will attempt to manage devices that the host already manages. Multiple other subsystems (`systemd-networkd`, `systemd-logind`) also use `/sys/` write access as an indicator that full device management is available. Leave `/sys/` read-only.
+
+    Exception: if the container has network namespaces, `/sys/class/net/` sub-directories for the container's own interfaces may be writable.
+  </Accordion>
+  <Accordion title="Do not mount only a sub-tree of cgroupfs">
+    `/proc/$PID/cgroup` reports full absolute paths. If only a sub-tree is mounted, the paths cannot be matched to the visible cgroup tree. Mount the full hierarchy, then restrict write access to the container's sub-tree.
+  </Accordion>
+  <Accordion title="Do not cross-link /dev/kmsg with /dev/console">
+    These are distinct interfaces. They cannot be linked to each other.
+  </Accordion>
+  <Accordion title="Do not pass CAP_AUDIT_CONTROL, CAP_AUDIT_READ, or CAP_AUDIT_WRITE">
+    The kernel audit subsystem is not namespaced. Passing audit capabilities to containers is meaningless and causes systemd to attempt to use audit, which then fails in various ways. Drop these capabilities for a clean boot.
+  </Accordion>
+</AccordionGroup>
+
+## Fully unprivileged containers
+
+Running systemd without `CAP_SYS_ADMIN` and `CAP_SYS_MKNOD` is supported but not recommended. When these capabilities are absent, systemd gracefully disables `PrivateTmp=`, `PrivateNetwork=`, `ProtectHome=`, `ProtectSystem=`, and similar features — meaning services that depend on those settings run in a less isolated environment.
+
+User namespaces improve this significantly. With user namespaces:
+
+- The `struct user` sharing problem (which causes `RLIMIT_NPROC` to be shared across containers) is eliminated.
+- Containers can hold `CAP_SYS_ADMIN` safely because capabilities are virtualized — having them inside the container does not grant them outside.

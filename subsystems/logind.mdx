@@ -1,0 +1,229 @@
+---
+title: "systemd-logind"
+description: "Login and session management daemon responsible for tracking user sessions, seats, inhibitor locks, and handling power key and lid switch events."
+---
+
+`systemd-logind` manages user logins, sessions, and seats. It tracks which users are logged in, which sessions they have, and which hardware seats those sessions run on. It also handles system-wide events like pressing the power button and integrates with PAM for session setup and teardown.
+
+---
+
+## Core concepts
+
+<CardGroup cols={3}>
+  <Card title="Sessions" icon="rectangle-terminal">
+    A session corresponds to a single login by a user — a TTY login, an SSH connection, or a graphical desktop. Each session has a unique numeric ID.
+  </Card>
+  <Card title="Users" icon="user">
+    A user record tracks all sessions belonging to a single UID. A `user@UID.service` manages per-user resources and lingering.
+  </Card>
+  <Card title="Seats" icon="display">
+    A seat is a collection of hardware (display, keyboard, mouse) that can support a local graphical session. Most systems have a single seat (`seat0`).
+  </Card>
+</CardGroup>
+
+---
+
+## loginctl
+
+`loginctl` is the command-line interface for `systemd-logind`.
+
+### Session commands
+
+```bash
+# List all active sessions
+loginctl list-sessions
+
+# Show detailed status of a session
+loginctl session-status 3
+
+# Show machine-parsable properties of a session
+loginctl show-session 3
+
+# Lock/unlock a session's screen
+loginctl lock-session 3
+loginctl unlock-session 3
+
+# Lock all sessions at once
+loginctl lock-sessions
+
+# Terminate a session and all its processes
+loginctl terminate-session 3
+```
+
+### User commands
+
+```bash
+# List all logged-in users
+loginctl list-users
+
+# Show status for a user
+loginctl user-status alice
+
+# Show machine-parsable properties
+loginctl show-user alice
+
+# Enable lingering — keep user manager alive after logout
+loginctl enable-linger alice
+loginctl disable-linger alice
+
+# Terminate all sessions for a user
+loginctl terminate-user alice
+```
+
+### Seat commands
+
+```bash
+# List all available seats
+loginctl list-seats
+
+# Show status of a seat
+loginctl seat-status seat0
+
+# Attach a device to a seat (for multi-seat setups)
+loginctl attach seat1 /sys/devices/pci0000:00/...
+
+# Remove all manual seat assignments
+loginctl flush-devices
+
+# Terminate all sessions on a seat
+loginctl terminate-seat seat1
+```
+
+---
+
+## Inhibitor locks
+
+Inhibitor locks let processes temporarily block or delay system sleep, shutdown, or idle actions. A music player might hold an inhibitor to prevent sleep while playing; a package manager might block shutdown while applying updates.
+
+```bash
+# List all active inhibitor locks
+loginctl list-inhibitors
+```
+
+Example output:
+```
+WHO          UID  USER PID   COMM            WHAT                         WHY                       MODE
+PackageKit   0    root 12345 packagekitd     shutdown:sleep               Package update in progress block
+NetworkManager 0  root 678   NetworkManager  sleep                        Disconnecting VPN          delay
+```
+
+**Lock modes:**
+
+| Mode | Behavior |
+|---|---|
+| `block` | The action is refused entirely while the lock is held |
+| `delay` | The action is postponed up to `InhibitDelayMaxSec=` seconds |
+
+**Lock types (`WHAT`):**
+
+| Type | Blocks |
+|---|---|
+| `shutdown` | System shutdown and reboot |
+| `sleep` | Suspend, hibernate, and hybrid sleep |
+| `idle` | System idle action |
+| `handle-power-key` | Power key handling by logind |
+| `handle-suspend-key` | Suspend key handling by logind |
+| `handle-lid-switch` | Lid switch handling by logind |
+
+---
+
+## Power management configuration
+
+`systemd-logind` handles hardware events and idle actions. Configuration is in `/etc/systemd/logind.conf` under the `[Login]` section.
+
+### Hardware key handling
+
+```ini
+[Login]
+# Power button — default: poweroff
+HandlePowerKey=poweroff
+
+# Long-press power button — default: ignore
+HandlePowerKeyLongPress=reboot
+
+# Suspend key — default: suspend
+HandleSuspendKey=suspend
+
+# Hibernate key — default: hibernate
+HandleHibernateKey=hibernate
+
+# Lid close — default: suspend
+HandleLidSwitch=suspend
+
+# Lid close when on external power — must be set explicitly
+HandleLidSwitchExternalPower=ignore
+
+# Lid close when docked — default: ignore
+HandleLidSwitchDocked=ignore
+```
+
+Valid values for all `Handle*=` settings:
+
+`ignore`, `poweroff`, `reboot`, `halt`, `kexec`, `suspend`, `hibernate`, `hybrid-sleep`, `suspend-then-hibernate`, `sleep`, `lock`
+
+### Idle action
+
+```ini
+[Login]
+# Action to take when all sessions are idle
+# Default: ignore
+IdleAction=suspend
+
+# How long to wait after all sessions go idle
+IdleActionSec=30min
+```
+
+### Session cleanup
+
+```ini
+[Login]
+# Kill all processes when a user logs out
+# Default: yes on most distributions
+KillUserProcesses=yes
+
+# Exclude specific users from process killing
+KillExcludeUsers=root
+
+# How long to keep the user manager alive after the last session ends
+UserStopDelaySec=10s
+```
+
+<Warning>
+  `KillUserProcesses=yes` terminates background processes like `screen` and `tmux` on logout. Use `systemd-run --scope` to move long-running processes out of the session scope, or set `KillUserProcesses=no`.
+</Warning>
+
+---
+
+## PAM integration
+
+`systemd-logind` integrates with PAM to create and register sessions at login time. The `pam_systemd` module handles this automatically when included in the PAM service configuration.
+
+When a user logs in through any PAM-aware service (SSH, GDM, a console getty), `pam_systemd` registers the session with `systemd-logind`, creates the session scope under `user-UID.slice`, and sets the `XDG_SESSION_ID`, `XDG_SESSION_TYPE`, and `XDG_RUNTIME_DIR` environment variables.
+
+A typical PAM session file includes:
+
+```
+# /etc/pam.d/system-login (distribution-provided)
+session   required  pam_systemd.so
+```
+
+`XDG_RUNTIME_DIR` is backed by a per-user tmpfs at `/run/user/UID` managed by logind. It is created on first login and removed when the last session ends (or when lingering is disabled and the user manager stops).
+
+---
+
+## Multi-seat configuration
+
+A seat groups the hardware assigned to a single local user session. On systems with multiple graphics cards and input devices, multiple seats allow multiple users to log in locally and independently.
+
+```bash
+# Attach graphics and input devices to a new seat
+loginctl attach seat1 /sys/devices/pci0000:01/0000:01:00.0
+loginctl attach seat1 /sys/devices/platform/i8042/serio1/input/input5
+
+# Verify the assignment
+loginctl seat-status seat1
+```
+
+<Note>
+  Seat assignments are written to `/etc/udev/rules.d/72-seat.rules` by `loginctl attach` and are persistent across reboots. Run `loginctl flush-devices` to remove all custom assignments.
+</Note>

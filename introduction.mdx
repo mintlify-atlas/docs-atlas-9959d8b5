@@ -1,0 +1,91 @@
+---
+title: "Introduction to systemd"
+description: "systemd is the system and service manager for Linux. It runs as PID 1, manages services, logging, networking, DNS, device events, login sessions, and the boot process."
+---
+
+systemd is a system and service manager for Linux operating systems. When the kernel finishes initializing hardware, it hands control to PID 1 — the init process. On modern Linux distributions, that process is systemd. From that point forward, systemd is responsible for bringing the system to a usable state and keeping it there.
+
+## What systemd is
+
+systemd serves as the first userspace process (PID 1) on a running Linux system. It replaces the traditional SysVinit system and brings with it a suite of tightly integrated components that manage nearly every aspect of a running system.
+
+At its core, systemd manages **units** — declarative descriptions of resources such as services, sockets, mount points, devices, and timers. When you start your system, systemd reads these unit files, resolves their dependencies, and activates them in parallel wherever possible.
+
+## Key capabilities
+
+systemd is not a single binary but a collection of cooperating daemons and tools:
+
+<CardGroup cols={2}>
+  <Card title="Service management" icon="gears">
+    `systemctl` lets you start, stop, enable, disable, and inspect services. The unit file format replaces shell scripts with structured, declarative configuration.
+  </Card>
+  <Card title="Logging (journald)" icon="scroll">
+    `systemd-journald` collects log output from services, the kernel, and early boot into a structured, indexed binary journal queryable with `journalctl`.
+  </Card>
+  <Card title="Networking (networkd)" icon="network-wired">
+    `systemd-networkd` configures network interfaces using `.network` files. It handles DHCP, static addressing, bridges, VLANs, and more.
+  </Card>
+  <Card title="DNS resolution (resolved)" icon="globe">
+    `systemd-resolved` provides a local DNS stub resolver at `127.0.0.53` with caching, DNSSEC validation, DNS-over-TLS, and LLMNR/mDNS support.
+  </Card>
+  <Card title="Device management (udev)" icon="microchip">
+    `systemd-udevd` handles kernel uevents, names devices, creates symlinks in `/dev`, and applies hardware database rules.
+  </Card>
+  <Card title="Login sessions (logind)" icon="user">
+    `systemd-logind` tracks user sessions, manages seat assignments, handles power-key events, and enforces idle and inhibitor locks.
+  </Card>
+  <Card title="Boot management (systemd-boot)" icon="power-off">
+    `systemd-boot` is a UEFI boot manager that presents a menu of boot entries and supports Unified Kernel Images (UKIs) with Secure Boot.
+  </Card>
+  <Card title="Time synchronization (timesyncd)" icon="clock">
+    `systemd-timesyncd` is a lightweight SNTP client that synchronizes the system clock and saves the current time across reboots.
+  </Card>
+</CardGroup>
+
+## Why systemd replaced SysVinit
+
+The traditional SysVinit init system started services sequentially by running shell scripts numbered to control ordering. This approach had several limitations that became increasingly painful as Linux systems grew more complex:
+
+- **Sequential startup** meant that services blocked on each other even when they could have been started in parallel, resulting in slow boot times.
+- **Shell scripts** were fragile, hard to introspect, and provided no standard way to track whether a service was running or had crashed.
+- **No dependency tracking** — ordering was implicit in script numbers, not in declared relationships. Removing or reordering a service could silently break others.
+- **No resource tracking** — once a daemon forked child processes, the init system lost track of them. Stopping a service might leave orphaned processes running.
+- **Limited logging** — services wrote to arbitrary log files or to syslog; there was no unified interface to query what had happened and when.
+
+systemd addresses all of these. Services are started in parallel based on declared dependencies. Cgroups ensure that every process spawned by a service is tracked and cleaned up on stop. The journal captures structured log output with metadata. Unit files are machine-readable and introspectable at runtime.
+
+## Architecture overview
+
+When the kernel executes `/usr/lib/systemd/systemd` as PID 1, systemd reads its configuration from unit files in `/usr/lib/systemd/system/` (shipped by packages) and `/etc/systemd/system/` (local overrides). It then:
+
+1. Activates the default target (usually `graphical.target` or `multi-user.target`), pulling in all required units transitively.
+2. Starts units in parallel, respecting `Requires=`, `Wants=`, `After=`, and `Before=` ordering constraints.
+3. Tracks each service's processes in a dedicated cgroup, so resource accounting and cleanup are reliable.
+4. Passes socket file descriptors to services on demand, enabling socket activation without the service needing to be running in advance.
+
+The companion daemons — `systemd-journald`, `systemd-udevd`, `systemd-logind`, `systemd-networkd`, `systemd-resolved`, and others — are ordinary systemd services that happen to provide system-level infrastructure. They communicate with PID 1 and with each other over D-Bus and Varlink.
+
+```
+Kernel
+  └─ PID 1: /usr/lib/systemd/systemd
+       ├─ systemd-journald.service   (logging)
+       ├─ systemd-udevd.service      (devices)
+       ├─ systemd-logind.service     (sessions)
+       ├─ systemd-networkd.service   (networking)
+       ├─ systemd-resolved.service   (DNS)
+       ├─ systemd-timesyncd.service  (time sync)
+       ├─ dbus.service               (IPC bus)
+       └─ ... application services
+```
+
+PID 1 is intentionally small. It delegates specialized work to separate daemons, each running with limited privileges and in its own cgroup slice. This separation means a bug in `systemd-resolved` does not crash the init process.
+
+<Note>
+All unit files shipped by packages live in `/usr/lib/systemd/system/`. To customize a unit without editing the vendor file, create a drop-in at `/etc/systemd/system/<unit>.d/override.conf` or copy the full file to `/etc/systemd/system/`. Files under `/etc/` take precedence.
+</Note>
+
+## Next steps
+
+<Card title="Quickstart" icon="rocket" href="/quickstart">
+  Learn the essential `systemctl` and `journalctl` commands and write your first service unit.
+</Card>

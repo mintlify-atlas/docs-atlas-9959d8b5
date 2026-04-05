@@ -1,0 +1,239 @@
+---
+title: "Coredump handling"
+description: "Capture, store, and analyze process coredumps with systemd-coredump and coredumpctl, including gdb integration and storage configuration."
+---
+
+When a process crashes, the kernel can produce a coredump — a snapshot of the process's memory at the time of the crash. systemd provides `systemd-coredump` to capture, compress, index, and store these dumps, and `coredumpctl` to inspect and debug them.
+
+---
+
+## How systemd-coredump works
+
+During very early boot, PID 1 raises `RLIMIT_CORE` to infinity for itself and all child processes, ensuring coredumps are not limited by size. At the same time it writes `|/bin/false` into `/proc/sys/kernel/core_pattern`, disabling coredump processing until the system is ready.
+
+Once the system is up, `systemd-sysctl.service` applies the drop-in file `/usr/lib/sysctl.d/50-coredump.conf`, which registers `systemd-coredump` as the kernel's coredump handler:
+
+```bash
+cat /proc/sys/kernel/core_pattern
+```
+
+```
+|/usr/lib/systemd/systemd-coredump %P %u %g %s %t %c %h
+```
+
+The handler is socket-activated: when the kernel invokes it, the coredump file descriptor is immediately handed off to `systemd-coredump@.service` via `systemd-coredump.socket`. Heavy processing (backtrace extraction, compression, ELF metadata parsing) happens inside the service unit, under resource management and sandboxing constraints.
+
+Coredump files are stored at `/var/lib/systemd/coredump/` and cleaned up periodically by `systemd-tmpfiles`.
+
+<Note>
+  Coredump handling is not available during very early boot or late shutdown. This is intentional — storage and other required facilities are not yet available at those stages.
+</Note>
+
+---
+
+## coredumpctl commands
+
+### Listing coredumps
+
+```bash
+# List all recorded coredumps
+coredumpctl list
+
+# List coredumps for a specific executable
+coredumpctl list /usr/bin/myapp
+
+# List coredumps for a specific systemd unit
+coredumpctl list _SYSTEMD_UNIT=myservice.service
+
+# Show only the most recent entry
+coredumpctl -1 list
+
+# Reverse order (newest first)
+coredumpctl --reverse list
+```
+
+The output table includes: TIME, PID, UID, GID, SIGNAL, COREFILE status, and EXE path.
+
+The `COREFILE` column indicates where the dump is stored:
+
+| Value | Meaning |
+|---|---|
+| `present` | Core file is on disk and accessible. |
+| `journal` | Core was stored inline in the journal. |
+| `truncated` | Core was stored but exceeded size limits and was truncated. |
+| `missing` | Core was stored but the file has since been removed. |
+| `none` | No core was stored. |
+| `error` | Core file exists but cannot be accessed (insufficient permissions). |
+
+### Showing detailed information
+
+```bash
+# Show detailed info about the most recent crash
+coredumpctl info
+
+# Show info for a specific PID
+coredumpctl info 12345
+
+# Show info for crashes matching an executable path
+coredumpctl info /usr/bin/myapp
+```
+
+The `info` output includes the signal, backtrace (if debug symbols are available), cgroup, unit name, executable path, and ELF package metadata.
+
+### Extracting a coredump
+
+```bash
+# Write the most recent core to a file
+coredumpctl dump -o /tmp/myapp.core
+
+# Write the core for a specific PID
+coredumpctl dump 12345 -o /tmp/myapp-12345.core
+```
+
+### Opening a coredump in gdb
+
+```bash
+# Open the most recent coredump in gdb
+coredumpctl debug
+
+# Debug a specific PID
+coredumpctl debug 12345
+
+# Use a different debugger
+coredumpctl debug --debugger=/usr/bin/lldb
+
+# Pass extra flags to gdb
+coredumpctl debug --debugger-arguments="-ex bt -ex quit"
+```
+
+<Tip>
+  Install the debuginfo package for the crashing binary before running `coredumpctl debug`. Without debug symbols, the backtrace will show only addresses, not function names.
+</Tip>
+
+---
+
+## Filtering coredumps
+
+Coredumps can be filtered by journal fields. Common filters:
+
+```bash
+# By executable path
+coredumpctl list /usr/bin/bash
+
+# By systemd unit
+coredumpctl list _SYSTEMD_UNIT=nginx.service
+
+# By user ID
+coredumpctl list _UID=1000
+
+# By signal
+coredumpctl list COREDUMP_SIGNAL=11
+
+# By time range
+coredumpctl list --since="2026-01-01" --until="2026-04-01"
+```
+
+---
+
+## coredump.conf configuration
+
+Global configuration lives in `/etc/systemd/coredump.conf` (and drop-ins under `/etc/systemd/coredump.conf.d/`).
+
+```ini
+# /etc/systemd/coredump.conf
+[Coredump]
+Storage=external
+Compress=yes
+ProcessSizeMax=2G
+ExternalSizeMax=2G
+JournalSizeMax=767K
+MaxUse=
+KeepFree=
+```
+
+### Key options
+
+| Option | Default | Description |
+|---|---|---|
+| `Storage=` | `external` | Where to store coredumps. `none` discards them, `external` writes to `/var/lib/systemd/coredump/`, `journal` stores inline in the journal. |
+| `Compress=` | `yes` | Whether to compress external coredumps using zstd. |
+| `ProcessSizeMax=` | 2G (64-bit) | Maximum size of a coredump that will be processed at all. Larger dumps are discarded. |
+| `ExternalSizeMax=` | 2G (64-bit) | Maximum size of a coredump stored to disk. Larger dumps are truncated. |
+| `JournalSizeMax=` | 767K | Maximum size of a coredump stored inline in the journal. |
+| `MaxUse=` | 10% of filesystem | Maximum disk space used for stored coredumps. |
+| `KeepFree=` | 15% of filesystem | Minimum free space to leave on the filesystem. Old coredumps are deleted to maintain this. |
+
+---
+
+## Journal integration
+
+Every coredump event is logged as a structured journal entry regardless of the `Storage=` setting. The journal entry contains the process metadata and, if `Storage=journal`, the compressed core data itself.
+
+You can query coredump events directly through `journalctl`:
+
+```bash
+journalctl -t systemd-coredump
+journalctl _SYSTEMD_UNIT=systemd-coredump@.service
+```
+
+This means coredump metadata persists even after the core file is cleaned up from disk. `coredumpctl list` will continue showing an entry (with `COREFILE=missing`) until the journal entry expires.
+
+---
+
+## Space management and retention
+
+Stored coredumps are cleaned up by `systemd-tmpfiles` according to the rules in `/usr/lib/tmpfiles.d/systemd.conf`. By default, coredumps older than 3 days are removed:
+
+```bash
+# Manually trigger tmpfiles cleanup
+systemd-tmpfiles --clean
+```
+
+You can also remove all stored coredumps immediately:
+
+```bash
+rm -rf /var/lib/systemd/coredump/
+```
+
+To check current disk usage:
+
+```bash
+du -sh /var/lib/systemd/coredump/
+```
+
+---
+
+## Opting out of coredump collection
+
+Individual processes or services can opt out by setting `RLIMIT_CORE` to `0`:
+
+```ini
+# In a service unit file
+[Service]
+LimitCORE=0
+```
+
+Or programmatically using `prctl(PR_SET_DUMPABLE, 0)` to mark a process as non-dumpable. The coredump handler respects these limits.
+
+---
+
+## Restoring legacy coredump behavior
+
+To revert to the kernel's default behavior (writing cores to the current working directory of the crashing process):
+
+```bash
+mkdir -p /etc/sysctl.d
+cat > /etc/sysctl.d/50-coredump.conf <<'EOF'
+kernel.core_pattern=core
+EOF
+```
+
+```bash
+mkdir -p /etc/systemd/system.conf.d
+cat > /etc/systemd/system.conf.d/50-coredump.conf <<'EOF'
+[Manager]
+DefaultLimitCORE=0:infinity
+EOF
+```
+
+Reboot for the changes to take effect. This is not recommended for production systems because cores written to the working directory of crashing processes are difficult to manage and may fill arbitrary directories.

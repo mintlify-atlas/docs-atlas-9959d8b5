@@ -1,0 +1,238 @@
+---
+title: "Units and targets"
+description: "Learn about the fundamental building blocks of systemd configuration: unit files, unit types, dependency directives, and target units."
+---
+
+A **unit file** is a plain text, INI-style configuration file that encodes information about a resource systemd knows how to manage. Everything systemd controls — a process, a mount point, a timer, a network socket — is described by a unit file.
+
+Unit names consist of a name prefix and a type suffix separated by a dot (for example, `nginx.service` or `home.mount`). The total length of a unit name must not exceed 255 characters.
+
+## Unit types
+
+systemd recognizes eleven unit types, each identified by its file suffix.
+
+<CardGroup cols={2}>
+  <Card title=".service" icon="gear">
+    A process controlled and supervised by systemd. The most common unit type.
+  </Card>
+  <Card title=".socket" icon="plug">
+    An IPC or network socket. Enables socket-based activation of services.
+  </Card>
+  <Card title=".target" icon="bullseye">
+    A grouping mechanism and synchronization point. Replaces SysVinit runlevels.
+  </Card>
+  <Card title=".timer" icon="clock">
+    A timer that activates another unit on a schedule, replacing cron jobs.
+  </Card>
+  <Card title=".mount" icon="hard-drive">
+    A file system mount point, corresponding to an `fstab` entry.
+  </Card>
+  <Card title=".automount" icon="folder-open">
+    An automount point that mounts a file system on first access.
+  </Card>
+  <Card title=".swap" icon="arrow-left-right">
+    A swap partition or file, corresponding to a swap entry in `fstab`.
+  </Card>
+  <Card title=".path" icon="magnifying-glass">
+    A path watched for changes that activates another unit when triggered.
+  </Card>
+  <Card title=".scope" icon="object-group">
+    A group of externally created processes registered with systemd at runtime.
+  </Card>
+  <Card title=".slice" icon="layer-group">
+    An inner node in the cgroup hierarchy used for resource management.
+  </Card>
+  <Card title=".device" icon="microchip">
+    A kernel device exposed via udev, used for device-based activation.
+  </Card>
+</CardGroup>
+
+## Unit file locations
+
+systemd searches a prioritized list of directories for unit files. Files found earlier in the list override those found later.
+
+| Path | Purpose |
+|------|---------|
+| `/etc/systemd/system/` | Local administrator configuration. Highest precedence for system units. |
+| `/run/systemd/system/` | Runtime units created by generators or the manager itself. |
+| `/usr/local/lib/systemd/system/` | Locally installed packages. |
+| `/usr/lib/systemd/system/` | Units shipped by the distribution. Lowest precedence. |
+
+<Note>
+Files in `/etc/systemd/system/` always take precedence over `/usr/lib/systemd/system/`. To customize a vendor-supplied unit without modifying it directly, create a drop-in directory at `/etc/systemd/system/<name>.d/` and place override files with a `.conf` extension inside it.
+</Note>
+
+For user units (managed by `systemd --user`), the equivalent paths are under `~/.config/systemd/user/` and `/usr/lib/systemd/user/`.
+
+## Unit file example
+
+A minimal service unit has three sections: `[Unit]` for metadata, `[Service]` for process configuration, and `[Install]` for enablement.
+
+```ini
+# /etc/systemd/system/myapp.service
+[Unit]
+Description=My Application Server
+Documentation=https://example.com/docs
+After=network.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/myapp --config /etc/myapp/config.toml
+Restart=on-failure
+User=myapp
+Group=myapp
+
+[Install]
+WantedBy=multi-user.target
+```
+
+<Tabs>
+  <Tab title="Service unit">
+    ```ini
+    [Unit]
+    Description=Redis In-Memory Data Store
+    After=network.target
+
+    [Service]
+    Type=notify
+    ExecStart=/usr/bin/redis-server /etc/redis/redis.conf
+    ExecStop=/usr/bin/redis-cli shutdown
+    Restart=always
+    User=redis
+
+    [Install]
+    WantedBy=multi-user.target
+    ```
+  </Tab>
+  <Tab title="Timer unit">
+    ```ini
+    [Unit]
+    Description=Daily database backup
+
+    [Timer]
+    OnCalendar=daily
+    Persistent=true
+
+    [Install]
+    WantedBy=timers.target
+    ```
+    Paired with a `backup-db.service` unit that performs the actual backup. The timer activates the service according to the schedule.
+  </Tab>
+  <Tab title="Socket unit">
+    ```ini
+    [Unit]
+    Description=Socket for myapp
+
+    [Socket]
+    ListenStream=/run/myapp/myapp.sock
+    SocketMode=0660
+    SocketUser=root
+    SocketGroup=myapp
+
+    [Install]
+    WantedBy=sockets.target
+    ```
+    systemd creates the socket before the service starts. The service is only launched when the first connection arrives.
+  </Tab>
+  <Tab title="Path unit">
+    ```ini
+    [Unit]
+    Description=Watch for new uploads
+
+    [Path]
+    PathExistsGlob=/var/spool/uploads/*.pending
+
+    [Install]
+    WantedBy=multi-user.target
+    ```
+    Activates a corresponding `process-uploads.service` whenever a `.pending` file appears in the watch directory.
+  </Tab>
+</Tabs>
+
+## Dependency directives
+
+Unit files express dependencies using directives in the `[Unit]` section. These directives control both what is pulled in and in what order units start.
+
+| Directive | Meaning |
+|-----------|---------|
+| `Wants=` | Pull in the listed units, but do not fail if they cannot be started. The recommended way to express optional dependencies. |
+| `Requires=` | Pull in the listed units. If any of them fail to start, this unit also fails. |
+| `After=` | Start this unit only after the listed units have finished starting. Does not imply `Wants=` or `Requires=`. |
+| `Before=` | Start this unit before the listed units begin starting. |
+| `BindsTo=` | Like `Requires=`, but also stops this unit when the bound unit stops. |
+| `Conflicts=` | Stop the listed units when this unit starts, and vice versa. Used for mutually exclusive units like `poweroff.target` and `graphical.target`. |
+
+<Warning>
+`After=` and `Before=` only affect ordering. They do not automatically add a dependency. To both require a unit and order after it, use `Requires=` and `After=` together.
+</Warning>
+
+## Unit templates and instances
+
+A unit filename containing `@` is a **template**. The part after `@` and before the type suffix is the **instance name**, accessible inside the unit file via the `%i` specifier.
+
+For example, `getty@.service` is a template that can be instantiated as `getty@tty1.service`, `getty@tty2.service`, and so on:
+
+```ini
+# /usr/lib/systemd/system/getty@.service
+[Unit]
+Description=Getty on %I
+After=systemd-user-sessions.service
+
+[Service]
+ExecStart=-/sbin/agetty -o '-p -- \\u' --noclear %I $TERM
+```
+
+## Target units
+
+Target units (`.target`) group other units together and provide named synchronization points during boot and shutdown. They have no additional options beyond the common `[Unit]` and `[Install]` sections.
+
+Target units are the systemd replacement for SysVinit runlevels. Where SysVinit used numeric runlevels (0–6), systemd uses descriptively named targets.
+
+| Target | SysVinit equivalent | Description |
+|--------|---------------------|-------------|
+| `poweroff.target` | runlevel 0 | Halt and power off |
+| `rescue.target` | runlevel 1 | Single-user rescue mode |
+| `multi-user.target` | runlevel 3 | Multi-user, non-graphical |
+| `graphical.target` | runlevel 5 | Multi-user with graphical desktop |
+| `reboot.target` | runlevel 6 | Reboot |
+
+### Key boot targets
+
+<AccordionGroup>
+  <Accordion title="default.target">
+    The target systemd activates at boot. It is always a symlink pointing to either `multi-user.target` or `graphical.target`. Change the default boot target with:
+
+    ```bash
+    systemctl set-default graphical.target
+    ```
+  </Accordion>
+  <Accordion title="sysinit.target">
+    Reached after the earliest initialization steps: mounting the API file systems (`/proc`, `/sys`, `/dev`), setting the hostname, loading kernel modules, and running `fsck`. Most services declare `After=sysinit.target`.
+  </Accordion>
+  <Accordion title="basic.target">
+    Reached after socket units, timers, and path units are set up. Provides the baseline environment that all regular services depend on.
+  </Accordion>
+  <Accordion title="multi-user.target">
+    The standard multi-user environment without a graphical display. Services that should start on a server typically declare `WantedBy=multi-user.target` in their `[Install]` section.
+  </Accordion>
+  <Accordion title="graphical.target">
+    Extends `multi-user.target` with a display manager and desktop session. Used on workstations.
+  </Accordion>
+  <Accordion title="network.target">
+    A passive target that indicates network configuration has been started. It does not guarantee the network is online. Use `network-online.target` when your service requires a working network connection.
+  </Accordion>
+</AccordionGroup>
+
+### Switching targets
+
+To change the current target (equivalent to switching runlevels):
+
+```bash
+# Switch to rescue mode
+systemctl isolate rescue.target
+
+# Switch to graphical mode
+systemctl isolate graphical.target
+```
+
+Only targets that have `AllowIsolate=yes` set can be used with `isolate`.

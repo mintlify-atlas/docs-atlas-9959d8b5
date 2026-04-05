@@ -1,0 +1,219 @@
+---
+title: "Repository Architecture"
+description: "A map of the systemd source tree: what each directory contains, how components depend on each other, and where to find tests, documentation, and build configuration."
+---
+
+The systemd repository is large and contains many components. This page provides a high-level map so you can quickly find where code lives and understand the layering rules between components.
+
+## Source tree layout
+
+```
+systemd/
+├── src/              # All daemons, libraries, and CLI tools
+├── units/            # systemd unit files shipped with the project
+├── man/              # Man pages (XML source)
+├── docs/             # Markdown documentation (published to systemd.io)
+├── test/             # Integration tests (TEST-*/) and fuzzer inputs
+├── hwdb.d/           # Static hardware database rules
+├── po/               # Translation files
+├── factory/          # Configuration templates and presets
+├── network/          # Default network configuration files
+├── rules.d/          # udev rules
+├── shell-completion/ # Bash and zsh completion scripts
+├── tools/            # Developer utilities (not installed)
+├── coccinelle/       # Semantic patch scripts for refactoring
+├── .github/          # CI and GitHub Actions configuration
+└── meson_options.txt # All build-time configuration knobs
+```
+
+## src/ directory organization
+
+### Shared primitives
+
+The code shared across components is layered into four directories. Each layer has strict rules about what it may depend on.
+
+<CardGroup cols={2}>
+
+<Card title="src/fundamental/" icon="cube">
+  Primitives shared between **EFI code and userspace**. Cannot depend on any other code in the tree. Used wherever both EFI and non-EFI code need the same logic.
+</Card>
+
+<Card title="src/basic/" icon="layer-group">
+  Userspace-only primitives. May depend only on `src/fundamental/` and itself. A static library is built from this code and linked statically across the project.
+</Card>
+
+<Card title="src/libsystemd/" icon="library">
+  Implementation of `libsystemd.so` (also available as `libsystemd.a`). May use `src/fundamental/` and `src/basic/`. This is the public C library exposed as the `sd-*` API.
+</Card>
+
+<Card title="src/shared/" icon="share-nodes">
+  Utilities shared between components that do link to `libsystemd-shared-<nnn>.so`. May use `src/fundamental/`, `src/basic/`, and `src/libsystemd/`.
+</Card>
+
+</CardGroup>
+
+### Dependency rules
+
+The table below defines exactly what each layer may import:
+
+| Directory | May depend on |
+|---|---|
+| `src/fundamental/` | Nothing outside `src/fundamental/` |
+| `src/basic/` | `src/fundamental/`, `src/basic/` |
+| `src/libsystemd/` | `src/fundamental/`, `src/basic/`, `src/libsystemd/` |
+| `src/shared/` | `src/fundamental/`, `src/basic/`, `src/libsystemd/`, `src/shared/` |
+| Per-component dirs | Any of the above, depending on which libraries they link |
+
+`src/shared/` may **not** be used by `src/basic/`, `src/libsystemd/`, `src/nss-*`, `src/login/pam_systemd.*`, or journal files that end up in `libjournal-client.a`.
+
+<Note>
+  Code should be linked as few times as possible — ideally once. If code is used only by one component, put it in that component's directory. If it must be shared, move it up the hierarchy to the appropriate shared layer.
+</Note>
+
+### Kernel and libc headers
+
+- `src/include/uapi/` — copies of kernel headers used by the project
+- `src/include/override/` — wrappers for libc and kernel headers that provide missing symbols
+
+### Key per-component directories
+
+<AccordionGroup>
+
+<Accordion title="src/core/ — PID 1 (the service manager)">
+
+Contains the main logic for both the system service manager and the per-user service manager. This is the code that runs as PID 1.
+
+Key files:
+- `src/core/main.c` — entry point
+- `src/core/load-fragment.c` — unit file parser
+- `src/core/load-fragment-gperf.gperf.in` — gperf-generated parser for unit settings
+- `src/core/dbus-*.c` — D-Bus interface implementations
+- `src/shared/bus-unit-util.c` — client-side D-Bus translation used by `systemctl set-property` and `systemd-run`
+- `src/core/bpf/` — BPF helpers written in C
+
+When starting a unit that requires a new process, PID 1 serializes configuration and passes it to `systemd-executor` via `posix_spawn()`. The executor applies sandboxing, namespacing, and cgroup configuration before calling `execve()` on the target binary:
+
+```
+ ┌──────┐posix_spawn() ┌───────────┐execve() ┌────────┐
+ │ PID1 ├─────────────►│sd-executor├────────►│program │
+ └──────┘  (memfd)     └───────────┘         └────────┘
+```
+
+</Accordion>
+
+<Accordion title="src/udev/ — the udev daemon and CLI">
+
+Source for both `udevd` and the `udevadm` command-line tool. They are compiled into a single binary.
+
+</Accordion>
+
+<Accordion title="src/boot/ — EFI bootloader">
+
+Source for `systemd-boot` (the EFI boot manager) and `systemd-stub` (the EFI unified kernel stub). EFI-only code lives here. Code shared with non-EFI components lives in `src/fundamental/`.
+
+</Accordion>
+
+<Accordion title="src/test/ — unit tests">
+
+Every file under `src/test/` compiles into a standalone test binary. Tests here correspond to modules in `src/basic/` and `src/shared/`:
+
+```
+src/basic/path-util.c  →  src/test/test-path-util.c
+```
+
+Most tests can run as an unprivileged user. Tests that need capabilities clearly log what they require. These tests are self-contained and safe to run on the host.
+
+</Accordion>
+
+<Accordion title="src/fuzz/ — fuzz targets">
+
+Fuzz targets for `src/basic/` and `src/shared/`. Fuzz targets for other parts of the codebase live next to the code they test. Fuzz targets are named `fuzz-*`.
+
+</Accordion>
+
+</AccordionGroup>
+
+## Integration tests
+
+Integration tests live under `test/TEST-*/`. They exercise full daemons and libraries at a system level and run under `systemd-nspawn` (fast) or QEMU (for tests that require hardware access, loop devices, `dm-crypt`, etc.). Tests that require extra privileges are clearly marked.
+
+Fuzzer input data lives under `test/fuzz/`, one subdirectory per fuzzer. These inputs include seed corpora and samples saved by fuzzing engines when they found a defect.
+
+## Unit files
+
+Systemd unit files shipped with the project (`.service`, `.target`, `.socket`, etc.) live under `units/`. Unit files are either static or generated from `.in` templates using meson's `configure_file()` or jinja2 during the build.
+
+## Man pages
+
+Man page source files (XML) live under `man/`. They should be kept in sync with changes to the corresponding binaries and D-Bus interfaces. Man pages use 2-space indentation.
+
+## Documentation
+
+Markdown files under `docs/` are automatically published to [systemd.io](https://systemd.io) via GitHub Pages. A minimal test (`meson test -C build/ github-pages`) runs as part of CI to verify formatting.
+
+## Build system
+
+systemd uses [Meson](https://mesonbuild.com/). All build-time configuration options are declared in `meson_options.txt` at the repository root.
+
+<Tabs>
+
+<Tab title="Common options">
+
+| Option | Type | Description |
+|---|---|---|
+| `mode` | `developer` / `release` | Enables extra checks in developer mode |
+| `bpf-framework` | feature | Build BPF programs from restricted C source |
+| `tests` | `true` / `unsafe` / `false` | Enable extra or unsafe tests |
+| `slow-tests` | boolean | Run slow tests by default |
+| `fuzz-tests` | boolean | Run fuzzer regression tests |
+| `man` | feature | Build and install man pages |
+| `efi` | boolean | Enable EFI / systemd-boot support |
+| `logind` | boolean | Install the systemd-logind stack |
+| `networkd` | boolean | Install the systemd-networkd stack |
+| `resolved` | boolean | Install the systemd-resolved stack |
+
+</Tab>
+
+<Tab title="Key build commands">
+
+```bash
+# Configure (run once or after option changes)
+meson setup build
+
+# Compile a specific target
+meson compile -C build <target>
+
+# Run a specific test (also rebuilds required targets)
+meson test -C build -v <TEST-NAME>
+
+# Run all tests
+meson test -C build --print-errorlogs -q
+```
+
+<Warning>
+  Never run `meson compile` and then `meson test` as separate steps. Run `meson test` directly — it rebuilds required targets automatically before executing tests.
+</Warning>
+
+</Tab>
+
+</Tabs>
+
+## System configuration files and presets
+
+Presets and configuration templates are distributed across several directories:
+
+| Directory | Contents |
+|---|---|
+| `factory/` | Default configuration file templates |
+| `modprobe.d/` | Module loading configuration |
+| `network/` | Default network configuration |
+| `presets/` | Unit enable/disable presets |
+| `rules.d/` | udev rules |
+| `shell-completion/` | Bash and zsh completion scripts |
+| `sysctl.d/` | Kernel parameter defaults |
+| `sysusers.d/` | System user/group definitions |
+| `tmpfiles.d/` | Temporary file management rules |
+
+## Developer utilities
+
+`tools/`, `coccinelle/`, `.github/`, `.semaphore/`, and `.mkosi/` host scripts and utilities used by maintainers. They are not installed on the target system.

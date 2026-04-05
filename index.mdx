@@ -1,97 +1,81 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "systemd — System and Service Manager"
+description: "The standard init system for Linux. Manage services, devices, networking, logging, and boot from PID 1 onwards."
 ---
 
-## Setting up
+systemd is the system and service manager for Linux. It runs as PID 1, brings up the rest of the system, and manages the full lifecycle of services — from boot to shutdown. systemd provides a unified toolset for service management, structured logging, network configuration, device management, and secure credential handling.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Introduction" icon="book-open" href="/introduction">
+    Learn what systemd is, what it does, and how it fits into a modern Linux system.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Start, stop, enable, and inspect services using systemctl in minutes.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Core Concepts" icon="layer-group" href="/concepts/units-and-targets">
+    Understand units, targets, dependencies, and the service lifecycle.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Developer Guide" icon="code" href="/contributing/hacking">
+    Build, test, and contribute to systemd using mkosi.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Key subsystems
 
-Everything you need to create world-class documentation.
+<CardGroup cols={3}>
+  <Card title="journald" icon="scroll" href="/subsystems/journald">
+    Structured binary logging with rich querying via journalctl.
+  </Card>
+  <Card title="networkd" icon="network-wired" href="/subsystems/networkd">
+    Network configuration management for wired, wireless, and virtual interfaces.
+  </Card>
+  <Card title="resolved" icon="magnifying-glass" href="/subsystems/resolved">
+    DNS/mDNS resolver with DNSSEC validation and caching.
+  </Card>
+  <Card title="logind" icon="user" href="/subsystems/logind">
+    Login session, seat, and inhibitor lock management.
+  </Card>
+  <Card title="udev" icon="microchip" href="/subsystems/udev">
+    Kernel device event manager and dynamic /dev population.
+  </Card>
+  <Card title="systemd-boot" icon="power-off" href="/operations/boot-loader">
+    Minimal UEFI boot manager integrated with the boot loader spec.
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Get started
 
-## Need inspiration?
+<Steps>
+  <Step title="Check your systemd version">
+    Verify systemd is running and check the version installed on your system.
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+    ```bash
+    systemctl --version
+    ```
+  </Step>
+  <Step title="List running services">
+    See all active units and their current state.
+
+    ```bash
+    systemctl list-units --type=service --state=running
+    ```
+  </Step>
+  <Step title="Enable a service at boot">
+    Enable a service to start automatically on next boot, then start it now.
+
+    ```bash
+    systemctl enable --now myservice.service
+    ```
+  </Step>
+  <Step title="Inspect logs">
+    Query the systemd journal for logs from a specific service.
+
+    ```bash
+    journalctl -u myservice.service -f
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  Most systemctl commands that modify system state require root privileges or membership in appropriate groups. Use `sudo` where needed.
+</Note>

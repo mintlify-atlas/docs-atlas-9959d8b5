@@ -1,0 +1,405 @@
+---
+title: "sd-bus: D-Bus IPC Library"
+description: "Reference for sd-bus, libsystemd's high-level D-Bus client and server library, covering connection management, method calls, object exposition, and error handling."
+---
+
+`sd-bus` is part of [libsystemd](/api/libsystemd) and provides a complete D-Bus IPC client and server implementation. It supports synchronous and asynchronous method calls, property access, signal emission and subscription, and vtable-based D-Bus object exposition. The `busctl(1)` command exposes the same functionality from the command line.
+
+```c
+#include <systemd/sd-bus.h>
+```
+
+```bash
+pkg-config --cflags --libs libsystemd
+```
+
+## Acquiring a bus connection
+
+The preferred way to connect to the system or user bus is through the thread-local default connection functions. These return a shared, reference-counted connection associated with the calling thread.
+
+```c
+int sd_bus_default(sd_bus **bus);
+int sd_bus_default_system(sd_bus **bus);
+int sd_bus_default_user(sd_bus **bus);
+```
+
+- `sd_bus_default()` connects to the user bus when called from within a user session, and to the system bus otherwise.
+- `sd_bus_default_system()` always connects to the system bus.
+- `sd_bus_default_user()` always connects to the user bus.
+
+Each call from the same thread returns the same object with an incremented reference count. Drop the reference with `sd_bus_unref()`.
+
+For independent (non-shared) connections, use:
+
+```c
+int sd_bus_open_system(sd_bus **bus);
+int sd_bus_open_user(sd_bus **bus);
+int sd_bus_open_system_remote(sd_bus **bus, const char *host);
+int sd_bus_open_system_machine(sd_bus **bus, const char *machine);
+```
+
+### Low-level connection setup
+
+For full control, create an unconnected bus object and configure it before connecting:
+
+```c
+int sd_bus_new(sd_bus **bus);
+int sd_bus_start(sd_bus *bus);
+```
+
+`sd_bus_new()` allocates a new, unconnected bus object. After setting the address with `sd_bus_set_address()` and other options, call `sd_bus_start()` to open the connection.
+
+### Reference counting and cleanup
+
+`sd-bus` objects are reference-counted. Use GCC/Clang cleanup attributes to automatically release resources:
+
+```c
+{
+    __attribute__((cleanup(sd_bus_flush_close_unrefp))) sd_bus *bus = NULL;
+
+    r = sd_bus_default_system(&bus);
+    if (r < 0) {
+        fprintf(stderr, "Failed to connect to system bus: %s\n", strerror(-r));
+        return r;
+    }
+    /* bus is closed and freed when the block exits */
+}
+```
+
+Key cleanup functions:
+
+| Function | Effect |
+|----------|--------|
+| `sd_bus_unref(bus)` | Drop a reference; free when count reaches zero |
+| `sd_bus_close_unref(bus)` | Close connection, then drop reference |
+| `sd_bus_flush_close_unref(bus)` | Flush pending writes, close, then drop reference |
+| `sd_bus_unrefp(busp)` | For use with `__attribute__((cleanup(...)))` |
+| `sd_bus_flush_close_unrefp(busp)` | For use with `__attribute__((cleanup(...)))` |
+
+## Calling methods
+
+### Synchronous method call
+
+`sd_bus_call_method()` is a convenience function that constructs the message, sends it, and waits for the reply in a single call:
+
+```c
+int sd_bus_call_method(
+    sd_bus *bus,
+    const char *destination,
+    const char *path,
+    const char *interface,
+    const char *member,
+    sd_bus_error *ret_error,
+    sd_bus_message **reply,
+    const char *types,
+    ...);
+```
+
+The `types` string uses D-Bus type signatures: `"s"` for string, `"u"` for uint32, `"o"` for object path, `"b"` for boolean, and so on. Variadic arguments follow in order.
+
+**Example — look up the unit containing the current process:**
+
+```c
+/* SPDX-License-Identifier: MIT-0 */
+/* Compile with: cc example.c -lsystemd */
+
+#include <errno.h>
+#include <stdio.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <systemd/sd-bus.h>
+
+#define _cleanup_(f) __attribute__((cleanup(f)))
+
+static int log_error(int error, const char *message) {
+    fprintf(stderr, "%s: %s\n", message, strerror(-error));
+    return error;
+}
+
+int main(int argc, char **argv) {
+    _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+    _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+    _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+    int r;
+
+    r = sd_bus_open_system(&bus);
+    if (r < 0)
+        return log_error(r, "Failed to acquire bus");
+
+    r = sd_bus_call_method(bus,
+                           "org.freedesktop.systemd1",
+                           "/org/freedesktop/systemd1",
+                           "org.freedesktop.systemd1.Manager",
+                           "GetUnitByPID",
+                           &error,
+                           &reply,
+                           "u",
+                           (unsigned) getpid());
+    if (r < 0)
+        return log_error(r, "GetUnitByPID call failed");
+
+    const char *ans;
+    r = sd_bus_message_read(reply, "o", &ans);
+    if (r < 0)
+        return log_error(r, "Failed to read reply");
+
+    printf("Unit path is \"%s\".\n", ans);
+    return 0;
+}
+```
+
+### Asynchronous method call
+
+`sd_bus_call_method_async()` sends the message without blocking. The callback is invoked from `sd_bus_process()` or the attached event loop when the reply arrives:
+
+```c
+int sd_bus_call_method_async(
+    sd_bus *bus,
+    sd_bus_slot **slot,
+    const char *destination,
+    const char *path,
+    const char *interface,
+    const char *member,
+    sd_bus_message_handler_t callback,
+    void *userdata,
+    const char *types,
+    ...);
+```
+
+## Reading and appending message data
+
+### sd_bus_message_append()
+
+Appends fields to a message using a D-Bus type string:
+
+```c
+int sd_bus_message_append(sd_bus_message *m, const char *types, …);
+```
+
+Type characters include: `y` (byte), `b` (boolean), `n` (int16), `q` (uint16), `i` (int32), `u` (uint32), `x` (int64), `t` (uint64), `d` (double), `s` (string), `o` (object path), `g` (signature), `v` (variant), `a` (array), `(…)` (struct).
+
+### sd_bus_message_read()
+
+Reads fields from a received message in the same type-string format:
+
+```c
+int sd_bus_message_read(sd_bus_message *m, const char *types, …);
+```
+
+## Exposing D-Bus objects
+
+Use `sd_bus_add_object_vtable()` to expose a D-Bus object with a static interface definition:
+
+```c
+int sd_bus_add_object_vtable(
+    sd_bus *bus,
+    sd_bus_slot **slot,
+    const char *path,
+    const char *interface,
+    const sd_bus_vtable *vtable,
+    void *userdata);
+```
+
+A vtable is an array of `sd_bus_vtable` entries terminated by `SD_BUS_VTABLE_END`. Build it with the provided macros:
+
+```c
+static const sd_bus_vtable vtable[] = {
+    SD_BUS_VTABLE_START(0),
+    SD_BUS_METHOD("Method1", "s", "s", method_handler, 0),
+    SD_BUS_SIGNAL("Signal1", "so", 0),
+    SD_BUS_WRITABLE_PROPERTY("Name", "s", NULL, NULL,
+                             offsetof(MyObject, name),
+                             SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+    SD_BUS_VTABLE_END
+};
+```
+
+**Full vtable server example:**
+
+```c
+/* SPDX-License-Identifier: MIT-0 */
+#define _GNU_SOURCE 1
+#include <errno.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <systemd/sd-bus.h>
+
+#define _cleanup_(f) __attribute__((cleanup(f)))
+
+typedef struct object {
+    char *name;
+    uint32_t number;
+} object;
+
+static int method(sd_bus_message *m, void *userdata, sd_bus_error *error) {
+    const char *string;
+    int r;
+
+    r = sd_bus_message_read(m, "s", &string);
+    if (r < 0) {
+        fprintf(stderr, "sd_bus_message_read() failed: %s\n", strerror(-r));
+        return 0;
+    }
+
+    r = sd_bus_reply_method_return(m, "s", string);
+    if (r < 0) {
+        fprintf(stderr, "sd_bus_reply_method_return() failed: %s\n", strerror(-r));
+        return 0;
+    }
+
+    return 1;
+}
+
+static const sd_bus_vtable vtable[] = {
+    SD_BUS_VTABLE_START(0),
+    SD_BUS_METHOD("Method1", "s", "s", method, 0),
+    SD_BUS_SIGNAL("Signal1", "so", 0),
+    SD_BUS_WRITABLE_PROPERTY("AutomaticStringProperty", "s", NULL, NULL,
+                             offsetof(object, name),
+                             SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+    SD_BUS_WRITABLE_PROPERTY("AutomaticIntegerProperty", "u", NULL, NULL,
+                             offsetof(object, number),
+                             SD_BUS_VTABLE_PROPERTY_EMITS_INVALIDATION),
+    SD_BUS_VTABLE_END
+};
+
+int main(int argc, char **argv) {
+    _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+    int r;
+
+    sd_bus_default(&bus);
+
+    object obj = { .number = 42 };
+    obj.name = strdup("example");
+    if (!obj.name)
+        return EXIT_FAILURE;
+
+    r = sd_bus_add_object_vtable(bus, NULL,
+                                 "/org/freedesktop/systemd/VtableExample",
+                                 "org.freedesktop.systemd.VtableExample",
+                                 vtable,
+                                 &obj);
+    if (r < 0) {
+        fprintf(stderr, "sd_bus_add_object_vtable() failed: %s\n", strerror(-r));
+        return EXIT_FAILURE;
+    }
+
+    r = sd_bus_request_name(bus, "org.freedesktop.systemd.VtableExample", 0);
+    if (r < 0) {
+        fprintf(stderr, "sd_bus_request_name() failed: %s\n", strerror(-r));
+        return EXIT_FAILURE;
+    }
+
+    for (;;) {
+        r = sd_bus_wait(bus, UINT64_MAX);
+        if (r < 0) {
+            fprintf(stderr, "sd_bus_wait() failed: %s\n", strerror(-r));
+            return EXIT_FAILURE;
+        }
+        r = sd_bus_process(bus, NULL);
+        if (r < 0) {
+            fprintf(stderr, "sd_bus_process() failed: %s\n", strerror(-r));
+            return EXIT_FAILURE;
+        }
+    }
+
+    free(obj.name);
+    return 0;
+}
+```
+
+## Properties
+
+### Reading properties
+
+```c
+int sd_bus_get_property(
+    sd_bus *bus,
+    const char *destination,
+    const char *path,
+    const char *interface,
+    const char *member,
+    sd_bus_error *ret_error,
+    sd_bus_message **reply,
+    const char *type);
+
+/* Convenience variants */
+int sd_bus_get_property_trivial(...);   /* scalar types */
+int sd_bus_get_property_string(...);    /* string properties */
+int sd_bus_get_property_strv(...);      /* string array properties */
+```
+
+### Setting properties
+
+```c
+int sd_bus_set_property(
+    sd_bus *bus,
+    const char *destination,
+    const char *path,
+    const char *interface,
+    const char *member,
+    sd_bus_error *ret_error,
+    const char *type,
+    ...);
+```
+
+## Emitting signals
+
+```c
+int sd_bus_emit_signal(
+    sd_bus *bus,
+    const char *path,
+    const char *interface,
+    const char *member,
+    const char *types,
+    ...);
+```
+
+## Replying to method calls
+
+From within a method handler, use:
+
+```c
+/* Return values to the caller */
+int sd_bus_reply_method_return(sd_bus_message *call, const char *types, ...);
+
+/* Return an error to the caller */
+int sd_bus_reply_method_error(sd_bus_message *call, const sd_bus_error *e);
+```
+
+## Error handling
+
+D-Bus errors are represented by `sd_bus_error`:
+
+```c
+sd_bus_error error = SD_BUS_ERROR_NULL;
+
+r = sd_bus_call_method(bus, ..., &error, &reply, ...);
+if (r < 0) {
+    fprintf(stderr, "Call failed: %s: %s\n",
+            error.name, error.message);
+    sd_bus_error_free(&error);
+}
+```
+
+Always call `sd_bus_error_free()` to release memory, or use `__attribute__((cleanup(sd_bus_error_free)))`.
+
+All sd-bus functions return a negative `errno`-style error code on failure and zero or a positive value on success.
+
+## Integration with sd-event
+
+Attach an sd-bus connection to an sd-event loop to handle D-Bus I/O as part of a unified event loop:
+
+```c
+int sd_bus_attach_event(sd_bus *bus, sd_event *event, int priority);
+```
+
+After attaching, `sd_event_loop()` handles both D-Bus and other event sources automatically. See [sd-event: Event Loop](/api/sd-event) for details on the event loop API.
+
+## See also
+
+- [D-Bus Interface Overview](/api/dbus-overview) — the interfaces systemd exposes
+- [sd-event: Event Loop](/api/sd-event) — integrate sd-bus into an event loop
+- [libsystemd Library](/api/libsystemd) — full libsystemd overview

@@ -1,0 +1,369 @@
+---
+title: "Coding Style"
+description: "Formatting rules, naming conventions, error handling patterns, and memory management practices for systemd C code."
+---
+
+systemd is written in C (ISO C17 with GNU extensions, internally). All contributions must follow the style described here. Public APIs exposed via `libsystemd.so` use a stricter subset — ISO C89 with a limited set of common extensions — so that consumers are not forced into C17 mode.
+
+## Formatting
+
+### Indentation
+
+Use **8-space indentation** — no tabs — in all C source files. Shell scripts use 4-space indentation; man pages use 2-space indentation.
+
+```c
+void some_function(int foo) {
+        if (foo > 0)
+                waldo();
+}
+```
+
+When breaking a function declaration across multiple lines, use double indentation (16 spaces) for the parameter list and leave a blank line between the declaration and the first variable:
+
+```c
+void some_function(
+                int foo,
+                bool bar,
+                char baz) {
+
+        int a, b, c;
+```
+
+### Line length
+
+Do not enforce 80-column wrapping. Aim for around 109 characters. The `.editorconfig`, `.vimrc`, and `.dir-locals.el` files in the repository configure this automatically.
+
+### Braces
+
+Opening braces go on the same line as the statement for control flow, and on the same line as the return type for function definitions:
+
+```c
+/* Correct */
+void foo() {
+}
+
+/* Avoid */
+void foo()
+{
+}
+```
+
+Single-line `if` bodies do not need braces:
+
+```c
+/* Correct */
+if (foobar)
+        waldo();
+
+/* Avoid */
+if (foobar) {
+        waldo();
+}
+```
+
+The `else` keyword goes on the same line as the closing `}`:
+
+```c
+if (foobar) {
+        find();
+        waldo();
+} else
+        dont_find_waldo();
+```
+
+### Comments
+
+Use `/* block comments */` for code you commit. Reserve `// line comments` for temporary debug annotations that must not be committed — this makes them easy to spot during review.
+
+### Pointer and cast syntax
+
+Write the `*` as part of the type, not the identifier:
+
+```c
+/* Correct */
+const char* foo(const char *input);
+(const char*) s;
+
+/* Avoid */
+const char *foo(const char *input);
+(const char *)s;
+```
+
+### Enums
+
+Define flags types using enums with bit-shift values, aligned vertically:
+
+```c
+typedef enum FoobarFlags {
+        FOOBAR_QUUX  = 1 << 0,
+        FOOBAR_WALDO = 1 << 1,
+        FOOBAR_XOXO  = 1 << 2,
+} FoobarFlags;
+```
+
+For non-flags enums, always add a `_MAX` sentinel and an `_INVALID` value set to `-EINVAL`:
+
+```c
+typedef enum FoobarMode {
+        FOOBAR_AAA,
+        FOOBAR_BBB,
+        FOOBAR_CCC,
+        _FOOBAR_MAX,
+        _FOOBAR_INVALID = -EINVAL,
+} FoobarMode;
+```
+
+For public API enums, use `_SD_ENUM_FORCE_S64()` to fix the enum size at 64 bits and preserve ABI compatibility when new values are added later.
+
+## Naming conventions
+
+- **Structures**: `PascalCase` (e.g., `FoobarContext`)
+- **Functions and variables**: `snake_case` (e.g., `parse_config_file`, `unit_count`)
+- **Public API functions**: prefixed with `sd_` and marked `_public_`
+- **Command-line argument variables**: prefixed with `arg_` (e.g., `arg_output_path`)
+- **Output-only return parameters**: prefixed with `ret_` (e.g., `ret_result`)
+- **Failure-only return parameters**: prefixed with `reterr_` (e.g., `reterr_line`)
+
+```c
+static int foobar_frobnicate(
+                Foobar *object,
+                const char *input,
+                char **ret_frobnicated,
+                unsigned *reterr_line,
+                unsigned *reterr_column) {
+        …
+        return 0;
+}
+```
+
+Parameter order: input parameters first, `ret_` parameters second-to-last, `reterr_` parameters last.
+
+When passing `NULL` or another sentinel to a function, annotate the argument name:
+
+```c
+/* Avoid */
+myfunction(NULL, NULL, NULL);
+
+/* Correct */
+myfunction(/* a= */ NULL, /* b= */ NULL, /* c= */ NULL);
+```
+
+## Error handling
+
+Functions that can fail return a **negative errno value** on error. Use positive or zero returns for success:
+
+```c
+r = some_operation();
+if (r < 0)
+        return log_error_errno(r, "Operation failed: %m");
+```
+
+Convert libc-style `-1`/`errno` errors using `RET_NERRNO()`:
+
+```c
+r = RET_NERRNO(unlink(path));
+r = RET_NERRNO(open("/some/file", O_RDONLY|O_CLOEXEC));
+```
+
+When the error value is synthetic (not from a called function), use `SYNTHETIC_ERRNO()`:
+
+```c
+n = read(fd, s, sizeof s);
+if (n != sizeof s)
+        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to read data");
+```
+
+When ignoring a return value intentionally, cast to `(void)` so static analysis tools understand it is deliberate:
+
+```c
+(void) unlink("/foo/bar/baz");
+```
+
+Use `assert()` to catch programming errors in internal code. In public libsystemd API calls, use `assert_return()` to validate arguments and return a sensible error code to callers.
+
+## Logging
+
+Functions are either **logging** or **non-logging**. Library code in `src/shared/` and similar must be non-logging (except at `LOG_DEBUG`). Only "main program" code produces non-debug log output.
+
+Choose log levels deliberately:
+
+| Level | Macro | When to use |
+|---|---|---|
+| `LOG_ERR` | `log_error_errno()` | Failures that are propagated |
+| `LOG_WARNING` | `log_warning_errno()` | Noteworthy failures we proceed past |
+| `LOG_NOTICE` | `log_notice()` | Important informational messages |
+| `LOG_INFO` | `log_info()` | Regular informational messages (default max) |
+| `LOG_DEBUG` | `log_debug()` | Always fine; hidden by default |
+
+Non-fatal warnings must make clear in English that the failure is not actionable, e.g.:
+
+```c
+log_warning_errno(r, "Failed to load optional config, ignoring: %m");
+```
+
+## Memory management
+
+### `_cleanup_` attribute macros
+
+Use `_cleanup_` macros to automatically free resources when a variable goes out of scope. This eliminates most manual `goto cleanup` patterns:
+
+```c
+_cleanup_free_ char *buf = NULL;
+_cleanup_fclose_ FILE *f = NULL;
+_cleanup_close_ int fd = -EBADF;
+```
+
+Common macros:
+
+| Macro | Frees |
+|---|---|
+| `_cleanup_free_` | Heap allocation via `free()` |
+| `_cleanup_fclose_` | `FILE *` via `fclose()` |
+| `_cleanup_close_` | File descriptor via `close()` |
+| `_cleanup_(foo_unrefp)` | Reference-counted object |
+
+### `TAKE_PTR` and `TAKE_FD`
+
+Transfer ownership out of a `_cleanup_`-managed variable without triggering the cleanup:
+
+```c
+_cleanup_free_ char *tmp = strdup("hello");
+char *result = TAKE_PTR(tmp);   /* tmp is now NULL; cleanup is a no-op */
+
+_cleanup_close_ int fd = open(...);
+int stored_fd = TAKE_FD(fd);    /* fd is set to -1; cleanup is a no-op */
+```
+
+### Avoiding fixed-size buffers
+
+Avoid `char buf[256]`. Use dynamic allocation, `alloca_safe()` for small stack buffers, or VLAs. Use `DECIMAL_STR_MAX` and `DECIMAL_STR_WIDTH` when you need to size a numeric string buffer.
+
+Do not use `alloca()`, `strdupa()`, or `strndupa()` directly — use the `_safe` variants which assert against stack overruns.
+
+### OOM handling
+
+Always check for allocation failure. In non-library code, use `log_oom()` to emit a short message. Never silently ignore a `NULL` return from `malloc()` or friends.
+
+## Global state
+
+Avoid global and static variables. Prefer passing state explicitly, using TLS (`thread_local`) for per-thread caches, or using `is_main_thread()` to guard main-thread-only caches. When global variables are necessary (e.g., parsed command-line arguments), make them `static` and follow the `arg_` naming prefix.
+
+## Using C constructs
+
+### Variable declarations
+
+Declare variables at the point where they can be initialized, not in a big block at the top of the function. Exception: `int r` (the status return variable) is typically declared last in the initial declaration block:
+
+```c
+{
+        uint64_t a;
+        int r;
+
+        r = frobnicate(&a);
+        if (r < 0)
+                …
+
+        uint64_t b = a + 1, c;
+
+        r = foobarify(a, b, &c);
+        if (r < 0)
+                …
+}
+```
+
+### Infinite loops
+
+Use `for (;;)` rather than `while (1)` or `while (true)`.
+
+### Struct initialization
+
+Use C99 designated initializers instead of `memset()`:
+
+```c
+/* Correct */
+struct foobar t = {
+        .foo = 7,
+        .bar = "bazz",
+};
+
+/* Avoid */
+struct foobar t;
+zero(t);
+t.foo = 7;
+t.bar = "bazz";
+```
+
+### Boolean downgrade
+
+Only use C's implicit truth test for actual booleans and pointers. For numeric variables with more than two meaningful values, write the comparison explicitly:
+
+```c
+if (b)          /* OK when b is boolean */
+if (b != 0)    /* required when b is numeric with multiple values */
+if (ptr)        /* OK for NULL checks on pointers */
+```
+
+## File descriptors
+
+Every new file descriptor must be created with `O_CLOEXEC` to prevent leaking into forked children:
+
+- `open()` — pass `O_CLOEXEC`
+- `socket()` / `socketpair()` — pass `SOCK_CLOEXEC`
+- `recvmsg()` — set `MSG_CMSG_CLOEXEC`
+- `fopen()` — pass `"e"` in the mode string
+- Duplication — use `F_DUPFD_CLOEXEC` instead of `F_DUPFD` or `dup()`
+
+Prefer `openat()`-style APIs when working with paths relative to a directory.
+
+## Functions to avoid
+
+| Avoid | Use instead |
+|---|---|
+| `memset(..., 0, ...)` | `memzero()` or `zero()` |
+| `strcmp()`, `strncmp()` | `streq()`, `strneq()` |
+| `strtol()`, `atoi()` | `safe_atoli()`, `safe_atou32()`, etc. |
+| `htonl()` / `ntohl()` | `htobe32()` / `be32toh()` |
+| `dup()` | `fcntl(fd, F_DUPFD_CLOEXEC, 3)` |
+| `fgets()` | `read_line()` |
+| `exit()` | Return from `main()`; use `_exit()` in forked children |
+| `basename()` / `dirname()` | `path_extract_filename()` / `path_extract_directory()` |
+| `FILENAME_MAX` | `PATH_MAX` or `NAME_MAX` |
+| `inet_ntop()` | `typesafe_inet_ntop()` or `IN_ADDR_TO_STRING()` |
+| `getenv()` | `secure_getenv()` (default; use `getenv()` only when explicitly appropriate) |
+
+## Destructors
+
+Destructors must:
+
+- Accept `NULL` and treat it as a no-op (like `free()`)
+- Return the same type they take, and always return `NULL`
+- Be able to destroy half-initialized objects
+
+```c
+/* Correct pattern — always works, always leaves p == NULL */
+p = foobar_unref(p);
+```
+
+Name destructors by convention:
+
+- `xyz_free()` — frees the object and all resources
+- `xyz_done()` / `xyz_clear()` — destroys contents but leaves object allocated
+- `xyz_unref()` / `xyz_ref()` — decrement/increment reference count
+
+## Tests
+
+Use the assertion macros from `tests.h` instead of bare `assert()` so failures produce descriptive output:
+
+```c
+ASSERT_OK(some_function());
+ASSERT_GE(result, 0);
+ASSERT_OK_ERRNO(glibc_call());   /* for functions that return -1 and set errno */
+```
+
+In integration tests, never use `grep -q` in a pipeline — it generates `SIGPIPE` for the preceding command. Use `grep >/dev/null` instead.
+
+## Committing
+
+- Subject lines must be prefixed with the component name: `journal: `, `nspawn: `, `core: `, etc.
+- Do not use `Signed-Off-By:`.
+- Keep comments in source code, not only in commit messages or PR cover letters — reviewers need to see them.

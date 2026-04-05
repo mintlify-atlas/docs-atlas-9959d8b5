@@ -1,0 +1,155 @@
+---
+title: "D-Bus Interface Overview"
+description: "An overview of the D-Bus interfaces exposed by systemd and its auxiliary daemons, with examples using busctl."
+---
+
+systemd and its auxiliary daemons expose functionality over D-Bus. Clients can call methods, read and set properties, and subscribe to signals using any D-Bus library. The `busctl` command-line tool lets you explore and invoke these interfaces directly from a shell.
+
+## Key interfaces
+
+<CardGroup cols={2}>
+  <Card title="org.freedesktop.systemd1" icon="gear">
+    The main service manager interface exposed by PID 1. Manages units, jobs, and system state.
+    Object path: `/org/freedesktop/systemd1`
+  </Card>
+  <Card title="org.freedesktop.login1" icon="user">
+    The logind interface for session, seat, and user management.
+    Object path: `/org/freedesktop/login1`
+  </Card>
+  <Card title="org.freedesktop.network1" icon="network-wired">
+    The networkd interface for link and network configuration.
+    Object path: `/org/freedesktop/network1`
+  </Card>
+  <Card title="org.freedesktop.resolve1" icon="magnifying-glass">
+    The resolved interface for DNS resolution and LLMNR.
+    Object path: `/org/freedesktop/resolve1`
+  </Card>
+  <Card title="org.freedesktop.hostname1" icon="server">
+    The hostnamed interface for hostname and machine-info management.
+    Object path: `/org/freedesktop/hostname1`
+  </Card>
+  <Card title="org.freedesktop.timedate1" icon="clock">
+    The timedated interface for time zone and NTP configuration.
+    Object path: `/org/freedesktop/timedate1`
+  </Card>
+  <Card title="org.freedesktop.locale1" icon="globe">
+    The localed interface for locale and keyboard layout settings.
+    Object path: `/org/freedesktop/locale1`
+  </Card>
+</CardGroup>
+
+## Object paths and interface naming
+
+D-Bus uses a hierarchical object path scheme similar to a filesystem path, for example `/org/freedesktop/systemd1`. Interfaces follow reverse-DNS naming: `org.freedesktop.systemd1.Manager`, `org.freedesktop.systemd1.Unit`, `org.freedesktop.systemd1.Service`.
+
+The service manager exposes several object types:
+
+- **Manager object** at `/org/freedesktop/systemd1` — the central entry point. Implements `org.freedesktop.systemd1.Manager`.
+- **Unit objects** at paths like `/org/freedesktop/systemd1/unit/ssh_2eservice` — implement both `org.freedesktop.systemd1.Unit` and a type-specific interface such as `org.freedesktop.systemd1.Service`.
+- **Job objects** at `/org/freedesktop/systemd1/job/N` — represent queued or running jobs.
+
+<Note>
+  Unit names are encoded in object paths: dots (`.`) are replaced with `_2e` and other special characters are percent-encoded. Use the `GetUnit` method or `busctl` to look up the path for a given unit name.
+</Note>
+
+## Methods, signals, and properties
+
+D-Bus communication uses three primitives:
+
+<AccordionGroup>
+  <Accordion title="Methods">
+    A method call is a request/response exchange. The caller sends a message with input arguments; the service replies with output arguments or an error. Example: calling `StartUnit` on the Manager interface to start a unit.
+  </Accordion>
+  <Accordion title="Signals">
+    Signals are one-way broadcast messages emitted by a service. No reply is expected. Clients subscribe using match rules. Example: the Manager emits `UnitNew` when a new unit is loaded.
+  </Accordion>
+  <Accordion title="Properties">
+    Properties are key-value pairs on an object, accessible via `org.freedesktop.DBus.Properties.Get` and `Set`. They can also emit `PropertiesChanged` signals when their value changes. Example: reading `ActiveState` on a unit object.
+  </Accordion>
+</AccordionGroup>
+
+## Exploring interfaces with busctl
+
+`busctl` is systemd's D-Bus introspection and invocation tool.
+
+### List all services on the system bus
+
+```bash
+busctl list
+```
+
+This prints all well-known names currently registered on the system bus, along with their PID and process name.
+
+### Introspect an interface
+
+```bash
+busctl introspect org.freedesktop.systemd1 /org/freedesktop/systemd1
+```
+
+This prints all interfaces, methods, signals, and properties on the Manager object.
+
+### Read a property
+
+```bash
+busctl get-property org.freedesktop.systemd1 \
+    /org/freedesktop/systemd1 \
+    org.freedesktop.systemd1.Manager \
+    Version
+```
+
+### Call a method
+
+```bash
+busctl call org.freedesktop.systemd1 \
+    /org/freedesktop/systemd1 \
+    org.freedesktop.systemd1.Manager \
+    GetUnit s ssh.service
+```
+
+This calls `GetUnit` with the string argument `ssh.service` and prints the returned object path.
+
+## Example: listing units via D-Bus
+
+The following example lists all loaded units by calling `ListUnits` on the Manager interface and printing the result.
+
+```bash
+busctl call org.freedesktop.systemd1 \
+    /org/freedesktop/systemd1 \
+    org.freedesktop.systemd1.Manager \
+    ListUnits
+```
+
+`ListUnits` returns an array of structures. Each structure contains: unit name, description, load state, active state, sub state, followed unit, object path, queued job ID, job type, and job object path.
+
+To display the output in a human-readable table:
+
+```bash
+busctl --json=pretty call org.freedesktop.systemd1 \
+    /org/freedesktop/systemd1 \
+    org.freedesktop.systemd1.Manager \
+    ListUnits
+```
+
+## The Manager interface
+
+The `org.freedesktop.systemd1.Manager` interface on `/org/freedesktop/systemd1` is the primary entry point. Key methods include:
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `GetUnit` | `(s) → (o)` | Return the object path for a unit by name |
+| `GetUnitByPID` | `(u) → (o)` | Return the object path for the unit containing a given PID |
+| `StartUnit` | `(ss) → (o)` | Start a unit; returns the job object path |
+| `StopUnit` | `(ss) → (o)` | Stop a unit; returns the job object path |
+| `RestartUnit` | `(ss) → (o)` | Restart a unit |
+| `ReloadUnit` | `(ss) → (o)` | Reload a unit's configuration |
+| `ListUnits` | `() → (a(ssssssouso))` | List all loaded units |
+| `ListUnitFiles` | `() → (a(ss))` | List all installed unit files |
+
+<Tip>
+  Time-valued properties on D-Bus interfaces are encoded in microseconds (μs), even when the corresponding unit file setting is in seconds.
+</Tip>
+
+## See also
+
+- [sd-bus: D-Bus IPC Library](/api/sd-bus) — programmatic access from C
+- [libsystemd Library](/api/libsystemd) — overview of the full libsystemd API

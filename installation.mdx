@@ -1,0 +1,364 @@
+---
+title: "Installation & Build"
+description: "Install systemd from your distribution's package manager or build it from source using meson. Includes kernel requirements, build options, and the mkosi development workflow."
+---
+
+systemd ships with every major Linux distribution. The easiest way to get started is through your distribution's package manager. Building from source is recommended only when you need a specific version, are developing systemd itself, or are packaging it for a new distribution.
+
+## Installing from package managers
+
+systemd is installed by default on most Linux distributions and does not need to be installed separately. The following commands are relevant for reinstallation or for installing optional components.
+
+<Tabs>
+  <Tab title="Fedora / RHEL / CentOS">
+    ```bash
+    sudo dnf install systemd
+    ```
+
+    To install optional components like the network daemon or resolved:
+
+    ```bash
+    sudo dnf install systemd-networkd systemd-resolved
+    ```
+  </Tab>
+  <Tab title="Debian / Ubuntu">
+    ```bash
+    sudo apt-get update
+    sudo apt-get install systemd
+    ```
+
+    To install optional components:
+
+    ```bash
+    sudo apt-get install systemd-networkd systemd-resolved
+    ```
+  </Tab>
+  <Tab title="Arch Linux">
+    systemd is part of the `base` package group on Arch and is installed by default. To reinstall:
+
+    ```bash
+    sudo pacman -S systemd systemd-libs
+    ```
+  </Tab>
+  <Tab title="openSUSE">
+    ```bash
+    sudo zypper install systemd
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+  Stable branches with backported patches are maintained in the [systemd-stable repository](https://github.com/systemd/systemd-stable). Distribution packages built from the git `main` branch are also available on [OBS (Open Build Service)](https://software.opensuse.org//download.html?project=system%3Asystemd&package=systemd) for testing newer versions.
+</Note>
+
+## Kernel requirements
+
+systemd requires a reasonably modern Linux kernel. The minimum and recommended baselines are:
+
+| Baseline | Kernel version | Notes |
+|----------|---------------|-------|
+| Minimum | ≥ 5.10 | Required for all basic functionality. Older kernels are not supported. |
+| Recommended | ≥ 5.14 | Kernels below 5.14 have significant feature gaps; the taint flag `old-kernel` will be set. |
+| Full functionality | ≥ 6.6 | Required for cgroup quota on tmpfs and several newer APIs. |
+
+systemd gracefully falls back when newer kernel APIs are unavailable, but some features — such as `PrivateUsers=`, `PrivateNetwork=`, `RestrictFileSystems=`, and `systemd-oomd` — require specific kernel configuration options.
+
+<Warning>
+  Kernel versions below 5.10 are not supported at all. Attempting to run current systemd on them will fail.
+</Warning>
+
+The following kernel configuration options are required:
+
+```
+CONFIG_DEVTMPFS
+CONFIG_CGROUPS
+CONFIG_INOTIFY_USER
+CONFIG_SIGNALFD
+CONFIG_TIMERFD
+CONFIG_EPOLL
+CONFIG_UNIX
+CONFIG_SYSFS
+CONFIG_PROC_FS
+CONFIG_FHANDLE
+CONFIG_SYSFS_DEPRECATED=n
+CONFIG_UEVENT_HELPER_PATH=""
+CONFIG_FW_LOADER_USER_HELPER=n
+```
+
+For UEFI systems and systemd-boot:
+
+```
+CONFIG_EFIVAR_FS
+CONFIG_EFI_PARTITION
+```
+
+For `systemd-oomd` (the userspace OOM killer):
+
+```
+CONFIG_PSI
+CONFIG_MEMCG
+```
+
+## Building from source
+
+<Steps>
+  <Step title="Install build dependencies">
+    You need meson ≥ 0.62.0, ninja, gcc ≥ 8.4, Python ≥ 3.9, glibc ≥ 2.34, and several libraries. On Fedora:
+
+    ```bash
+    sudo dnf builddep systemd
+    ```
+
+    On Debian/Ubuntu:
+
+    ```bash
+    sudo apt-get build-dep systemd
+    ```
+
+    Key build-time dependencies include:
+
+    | Dependency | Version | Required |
+    |-----------|---------|----------|
+    | meson | ≥ 0.62.0 | Yes |
+    | ninja | any | Yes |
+    | gcc | ≥ 8.4 | Yes |
+    | Python | ≥ 3.9 | Yes |
+    | glibc | ≥ 2.34 | Yes |
+    | libmount (util-linux) | ≥ 2.30 | Yes |
+    | gperf | any | Yes |
+    | python-jinja2 | any | Yes |
+    | libseccomp | ≥ 2.4.0 | Optional |
+    | libcryptsetup | ≥ 2.4.0 | Optional |
+    | openssl | ≥ 3.0.0 | Optional (DNS-over-TLS) |
+    | clang + llvm | ≥ 10.0 | Optional (BPF programs) |
+  </Step>
+
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/systemd/systemd.git
+    cd systemd
+    ```
+
+    To build a specific stable version, use the [systemd-stable](https://github.com/systemd/systemd-stable) repository instead.
+  </Step>
+
+  <Step title="Configure the build">
+    ```bash
+    meson setup build/
+    ```
+
+    To enable or disable specific features, pass `-D` options:
+
+    ```bash
+    meson setup build/ \
+      -Dmode=release \
+      -Dnetworkd=true \
+      -Dresolved=true \
+      -Dlogind=true \
+      -Dman=disabled
+    ```
+
+    After the build directory is configured, change options with:
+
+    ```bash
+    meson configure -Darg=value build/
+    ```
+
+    Run `meson configure build/` without arguments to see all available options and their current values.
+  </Step>
+
+  <Step title="Compile">
+    ```bash
+    ninja -C build/
+    ```
+
+    Or using the meson wrapper:
+
+    ```bash
+    meson compile -C build/
+    ```
+  </Step>
+
+  <Step title="Install">
+    ```bash
+    sudo meson install -C build/ --no-rebuild
+    ```
+
+    To install to a staging directory:
+
+    ```bash
+    DESTDIR=/path/to/staging meson install -C build/
+    ```
+
+    <Warning>
+      The build prefix for systemd must be `/usr/`. Split-usr and unmerged-usr systems are not supported. All files must live under `/usr/`.
+    </Warning>
+  </Step>
+</Steps>
+
+## Key meson build options
+
+The following options are commonly adjusted when building systemd:
+
+<AccordionGroup>
+  <Accordion title="Core feature toggles">
+    | Option | Description |
+    |--------|-------------|
+    | `-Dmode=release` | Enable optimizations suitable for release builds (default is `developer`) |
+    | `-Dnetworkd=true` | Build and install systemd-networkd |
+    | `-Dresolved=true` | Build and install systemd-resolved |
+    | `-Dlogind=true` | Build and install systemd-logind |
+    | `-Dbootloader=enabled` | Build systemd-boot and the EFI stub |
+    | `-Dnspawn=enabled` | Build systemd-nspawn container manager |
+    | `-Dhomed=enabled` | Build systemd-homed |
+    | `-Doomd=true` | Build systemd-oomd (userspace OOM killer) |
+    | `-Dcoredump=true` | Build the coredump handler |
+    | `-Drepart=enabled` | Build systemd-repart |
+  </Accordion>
+
+  <Accordion title="Security and cryptography">
+    | Option | Description |
+    |--------|-------------|
+    | `-Dseccomp=enabled` | Enable seccomp syscall filtering support |
+    | `-Dselinux=enabled` | Enable SELinux MAC support |
+    | `-Dapparmor=enabled` | Enable AppArmor MAC support |
+    | `-Dopenssl=enabled` | Enable OpenSSL (required for DNS-over-TLS) |
+    | `-Dtpm2=enabled` | Enable TPM2 support for credentials and boot measurement |
+    | `-Dp11kit=enabled` | Enable p11-kit for PKCS#11 token support |
+    | `-Dlibfido2=enabled` | Enable FIDO2 hardware token support |
+  </Accordion>
+
+  <Accordion title="DNS and networking options">
+    | Option | Description |
+    |--------|-------------|
+    | `-Ddefault-dnssec=allow-downgrade` | Default DNSSEC mode (`yes`, `allow-downgrade`, `no`) |
+    | `-Ddefault-dns-over-tls=no` | Default DNS-over-TLS mode (`yes`, `opportunistic`, `no`) |
+    | `-Ddefault-mdns=yes` | Default mDNS mode (`yes`, `resolve`, `no`) |
+    | `-Ddefault-llmnr=yes` | Default LLMNR mode (`yes`, `resolve`, `no`) |
+    | `-Ddns-servers=...` | Space-separated list of fallback DNS servers |
+    | `-Dntp-servers=...` | Space-separated list of fallback NTP servers |
+  </Accordion>
+
+  <Accordion title="Compression and journal">
+    | Option | Description |
+    |--------|-------------|
+    | `-Dzstd=enabled` | Enable zstd compression (recommended) |
+    | `-Dlz4=enabled` | Enable lz4 compression |
+    | `-Dxz=enabled` | Enable xz compression |
+    | `-Ddefault-compression=auto` | Default journal compression algorithm |
+    | `-Djournal-storage-default=auto` | Default journal storage mode (`persistent`, `auto`, `volatile`, `none`) |
+  </Accordion>
+
+  <Accordion title="Documentation and tests">
+    | Option | Description |
+    |--------|-------------|
+    | `-Dman=enabled` | Build and install man pages (requires docbook-xsl and xsltproc) |
+    | `-Dhtml=enabled` | Build and install HTML documentation |
+    | `-Dtests=true` | Build test executables |
+    | `-Dslow-tests=true` | Run slow tests by default |
+    | `-Dinstall-tests=true` | Install test executables to the system |
+  </Accordion>
+</AccordionGroup>
+
+## mkosi-based development workflow
+
+The systemd project uses [mkosi](https://mkosi.systemd.io/) as its primary development tool. mkosi builds a minimal OS image with your locally compiled systemd installed, which you can boot in a VM or container to test changes end-to-end.
+
+<Steps>
+  <Step title="Install mkosi">
+    Clone mkosi from its repository (the packaged version in distributions is often too old):
+
+    ```bash
+    git clone https://github.com/systemd/mkosi.git
+    ln -s $PWD/mkosi/bin/mkosi ~/.local/bin/mkosi
+    ```
+
+    Make sure `~/.local/bin` is in your `$PATH`.
+  </Step>
+
+  <Step title="Clone systemd and set up the build">
+    ```bash
+    git clone https://github.com/systemd/systemd.git
+    cd systemd
+    mkosi -f genkey                                     # Generate signing keys (once)
+    mkosi -f box -- meson setup build/                  # Configure the build
+    mkosi -f box -- meson compile -C build/             # Compile systemd
+    ```
+
+    <Note>
+      On Ubuntu Noble and older, BPF framework detection inside the mkosi box is broken. Disable it explicitly:
+      ```bash
+      mkosi -f box -- meson setup -Dbpf-framework=disabled build/
+      ```
+    </Note>
+  </Step>
+
+  <Step title="Run the unit tests">
+    ```bash
+    mkosi -f box -- meson test -C build/ --print-errorlogs -q
+    ```
+  </Step>
+
+  <Step title="Build and boot the OS image">
+    ```bash
+    mkosi -f box -- meson compile -C build/ mkosi    # Build the OS image
+    mkosi boot                                        # Boot with systemd-nspawn
+    mkosi vm                                          # Boot with QEMU
+    ```
+  </Step>
+
+  <Step title="Test changes without rebuilding the full image">
+    After modifying source files and recompiling, push updated packages into a running image:
+
+    <CodeGroup>
+
+    ```bash Fedora / CentOS
+    mkosi -R && mkosi ssh -- dnf upgrade --disablerepo="*" --assumeyes "/work/build/*.rpm"
+    ```
+
+    ```bash Debian / Ubuntu
+    mkosi -R && mkosi ssh -- apt-get install "/work/build/*.deb"
+    ```
+
+    ```bash Arch Linux
+    mkosi -R && mkosi ssh -- pacman --upgrade --needed --noconfirm "/work/build/*.pkg.tar"
+    ```
+
+    </CodeGroup>
+
+    Then restart the affected daemon:
+
+    ```bash
+    systemctl restart <unit>
+    ```
+
+    Or, if you changed PID 1 behavior:
+
+    ```bash
+    systemctl daemon-reexec
+    ```
+  </Step>
+</Steps>
+
+## Runtime dependencies
+
+At runtime, systemd requires:
+
+- **util-linux ≥ 2.41** — provides `mount`, `umount`, `swapon`, `swapoff`, `sulogin`, `agetty`, and `fsck`
+- **D-Bus ≥ 1.4.0** — strongly recommended; required for most management interfaces
+- The `/run` mount point must exist, and `/var/run` must be a symlink to `/run`
+
+<Tip>
+  On systemd systems, `nss-systemd` must be enabled in `/etc/nsswitch.conf`. It is required for `DynamicUser=` to work correctly. Many systemd-shipped services use `DynamicUser=`, so this is not optional in practice.
+</Tip>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Learn essential `systemctl` and `journalctl` commands.
+  </Card>
+  <Card title="Hacking on systemd" icon="code" href="/contributing/hacking">
+    Contribute to systemd: coding style, PR workflow, and the full mkosi development guide.
+  </Card>
+</CardGroup>

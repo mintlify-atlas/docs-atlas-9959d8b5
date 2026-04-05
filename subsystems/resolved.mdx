@@ -1,0 +1,224 @@
+---
+title: "systemd-resolved"
+description: "Local DNS stub resolver providing caching, DNSSEC validation, DNS-over-TLS, mDNS, and LLMNR for the system and individual network links."
+---
+
+`systemd-resolved` is a system service that provides network name resolution. It acts as a local caching stub resolver, supports DNSSEC validation, DNS-over-TLS, Multicast DNS (mDNS), and Link-Local Multicast Name Resolution (LLMNR), and integrates tightly with `systemd-networkd` for per-link DNS configuration.
+
+---
+
+## The stub listener
+
+`systemd-resolved` listens on the loopback address `127.0.0.53` on UDP and TCP port 53. This stub listener receives DNS queries from local applications and forwards them to the appropriate upstream servers.
+
+A second listener at `127.0.0.54` is used specifically for DNS-over-TLS and bypasses some of the routing logic used by the main stub.
+
+---
+
+## /etc/resolv.conf integration
+
+`systemd-resolved` supports multiple modes for `/etc/resolv.conf`. The recommended approach is to symlink it to the stub resolver:
+
+<Tabs>
+  <Tab title="Stub mode (recommended)">
+    ```bash
+    ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+    ```
+
+    Points `127.0.0.53` as the nameserver. All applications use the full feature set of `systemd-resolved` including caching, DNSSEC, and per-link routing.
+  </Tab>
+  <Tab title="Full resolver mode">
+    ```bash
+    ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+    ```
+
+    Contains the actual upstream DNS servers currently in use. Applications bypass `systemd-resolved`'s cache but still see the correct servers.
+  </Tab>
+  <Tab title="Static file">
+    Edit `/etc/resolv.conf` directly. `systemd-resolved` reads it for fallback but does not manage it. Changes here override `resolved.conf` DNS settings.
+  </Tab>
+</Tabs>
+
+<Warning>
+  If `/etc/resolv.conf` is a regular file not managed by `systemd-resolved`, the daemon reads it on startup to seed its fallback DNS list. However, per-link DNS from DHCP will still be used and take priority.
+</Warning>
+
+---
+
+## Configuration
+
+The main configuration file is `/etc/systemd/resolved.conf`. Options go in the `[Resolve]` section.
+
+### DNS servers
+
+```ini
+[Resolve]
+# Space-separated list of global DNS servers
+DNS=9.9.9.9 149.112.112.112 2620:fe::fe
+
+# Fallback servers used only when no other DNS is available
+FallbackDNS=1.1.1.1 8.8.8.8
+
+# Global search domains
+Domains=example.com internal.corp
+```
+
+### DNSSEC
+
+```ini
+[Resolve]
+# true             – enforce DNSSEC, fail if server doesn't support it
+# allow-downgrade  – try DNSSEC, silently disable if unsupported
+# false            – disable DNSSEC validation
+DNSSEC=allow-downgrade
+```
+
+<Note>
+  DNSSEC requires a DNS server that supports it. Use `allow-downgrade` on networks where DNS server support is uncertain. Use `true` only when you control the DNS infrastructure.
+</Note>
+
+### DNS-over-TLS
+
+```ini
+[Resolve]
+# true          – require TLS, fail if not supported
+# opportunistic – use TLS if available, fall back to plaintext
+# false         – never use TLS
+DNSOverTLS=opportunistic
+```
+
+To validate the server certificate with TLS, specify the server name in `DNS=`:
+
+```ini
+[Resolve]
+DNS=9.9.9.9#dns.quad9.net
+DNSOverTLS=true
+```
+
+### Multicast DNS and LLMNR
+
+```ini
+[Resolve]
+# Multicast DNS (RFC 6762) — .local domain resolution
+# true / resolve / false
+MulticastDNS=yes
+
+# Link-Local Multicast Name Resolution (RFC 4795)
+# true / resolve / false
+LLMNR=resolve
+```
+
+<Tip>
+  Use `MulticastDNS=resolve` to answer queries for `.local` names without advertising your own hostname on the local network.
+</Tip>
+
+---
+
+## resolvectl
+
+`resolvectl` is the command-line interface for querying and configuring `systemd-resolved` at runtime.
+
+### Status and diagnostics
+
+```bash
+# Show global and per-link DNS configuration
+resolvectl status
+
+# Show resolution statistics and DNSSEC status
+resolvectl statistics
+
+# Flush the DNS cache
+resolvectl flush-caches
+
+# Monitor all local DNS queries in real time
+resolvectl monitor
+```
+
+### Name resolution
+
+```bash
+# Resolve a hostname
+resolvectl query www.example.com
+
+# Reverse lookup
+resolvectl query 93.184.216.34
+
+# Query a specific record type
+resolvectl query --type=MX example.com
+
+# Query using a specific interface
+resolvectl query --interface=eth0 internal.corp
+```
+
+### Per-link runtime configuration
+
+These changes are runtime-only and are lost when the link goes down or `systemd-resolved` restarts.
+
+```bash
+# Set DNS servers for a link
+resolvectl dns eth0 192.168.1.53 192.168.1.54
+
+# Set search domains for a link
+resolvectl domain eth0 corp.example.com example.com
+
+# Set this link as the default route for DNS
+resolvectl default-route eth0 yes
+
+# Enable DNSSEC on a specific link
+resolvectl dnssec eth0 true
+
+# Enable DNS-over-TLS on a specific link
+resolvectl dnsovertls eth0 opportunistic
+
+# Revert all per-link settings to defaults
+resolvectl revert eth0
+```
+
+---
+
+## Per-link DNS via networkd
+
+`systemd-networkd` passes per-link DNS configuration to `systemd-resolved` automatically from DHCP leases or static `.network` file settings:
+
+```ini
+# /etc/systemd/network/20-wired.network
+[Match]
+Name=eth0
+
+[Network]
+DHCP=yes
+# Static per-link DNS in addition to DHCP-provided servers
+DNS=10.0.0.53
+Domains=internal.corp ~corp.example.com
+
+# Whether this link is used as a fallback for all DNS queries
+DNSDefaultRoute=yes
+```
+
+<Note>
+  Per-link DNS configuration from `systemd-networkd` takes priority over the global `DNS=` setting in `resolved.conf`.
+</Note>
+
+---
+
+## How resolved routes queries
+
+`systemd-resolved` follows this routing logic for each DNS query:
+
+<Steps>
+  <Step title="Check local sources">
+    Consult `/etc/hosts`, the local hostname, and the `localhost` entry. These always resolve without network access.
+  </Step>
+  <Step title="Check mDNS / LLMNR">
+    For `.local` domains (mDNS) or single-label names (LLMNR), resolve via multicast on the local network.
+  </Step>
+  <Step title="Route to per-link DNS">
+    If a link has a route-only or search domain matching the query, send to that link's DNS servers.
+  </Step>
+  <Step title="Use global DNS">
+    For queries not matched by per-link routing, use the global DNS servers from `resolved.conf` or `/etc/resolv.conf`.
+  </Step>
+  <Step title="Fall back">
+    If no global DNS is configured, use the compiled-in fallback list.
+  </Step>
+</Steps>

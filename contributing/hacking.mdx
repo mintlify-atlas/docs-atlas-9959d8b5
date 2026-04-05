@@ -1,0 +1,315 @@
+---
+title: "Hacking on systemd"
+description: "Set up a development environment with mkosi, build systemd from source, run tests, and submit a pull request."
+---
+
+systemd uses [mkosi](https://mkosi.systemd.io/) as its primary development tool. mkosi handles all build dependencies, constructs a bootable OS image with the latest systemd installed, and provides the environment for running unit and integration tests — all without affecting your host system.
+
+<Note>
+  Read the mkosi documentation on "Unprivileged User Namespaces" before starting. Run `mkosi documentation` to view it, then apply any instructions needed for your system.
+</Note>
+
+## Setting up the development environment
+
+<Steps>
+
+<Step title="Install mkosi">
+
+Install mkosi from the [GitHub repository](https://github.com/systemd/mkosi#running-mkosi-from-the-repository) by cloning it and symlinking the binary. The version shipped by your distribution is likely too old — systemd regularly adopts mkosi features that haven't reached a release yet.
+
+```bash
+git clone https://github.com/systemd/mkosi.git
+ln -s $PWD/mkosi/bin/mkosi ~/.local/bin/mkosi
+```
+
+Make sure `~/.local/bin` is in your `$PATH`.
+
+</Step>
+
+<Step title="Clone the systemd repository">
+
+```bash
+git clone https://github.com/systemd/systemd.git
+cd systemd
+```
+
+</Step>
+
+<Step title="Create a branch">
+
+```bash
+git checkout -b <your-branch-name>
+```
+
+</Step>
+
+<Step title="Generate signing keys">
+
+Run this once per clone. The keys are used to sign the EFI binaries in the OS image.
+
+```bash
+mkosi -f genkey
+```
+
+</Step>
+
+<Step title="Set up the build">
+
+```bash
+mkosi -f box -- meson setup -Dbpf-framework=disabled build
+```
+
+<Note>
+  The `-Dbpf-framework=disabled` flag works around a broken `bpftool` detection inside the mkosi box environment on Ubuntu Noble and older.
+</Note>
+
+</Step>
+
+<Step title="Compile">
+
+```bash
+mkosi -f box -- meson compile -C build
+```
+
+</Step>
+
+</Steps>
+
+## Running tests
+
+### Unit tests
+
+Run the unit test suite directly after compiling:
+
+```bash
+mkosi -f box -- meson test -C build --print-errorlogs -q
+```
+
+Meson automatically rebuilds any stale targets before running tests, so you do not need to run `meson compile` separately before `meson test`.
+
+To run a single named test:
+
+```bash
+mkosi -f box -- meson test -C build -v <TEST-NAME>
+```
+
+### Integration tests
+
+Integration tests live under `test/TEST-*/` and exercise full daemons and libraries at a system level. Most run via `systemd-nspawn` (much faster than QEMU), but some require privileged operations such as `dm-crypt` or loop devices and are clearly marked.
+
+Build the OS image and boot it to run integration tests:
+
+```bash
+mkosi -f box -- meson compile -C build mkosi   # Build the OS image
+mkosi boot                                      # Boot with systemd-nspawn
+mkosi vm                                        # Boot with QEMU
+```
+
+See [`test/integration-tests/README.md`](https://github.com/systemd/systemd/blob/main/test/integration-tests/README.md) for details.
+
+<Warning>
+  Never use `mkosi box` to wrap commands directly. You are either running inside an mkosi box environment already, or you are running outside it — use the tools available in your current environment directly. The `mkosi -f box -- <cmd>` form used above launches a fresh box session for the given command; it is not the same as the bare `mkosi box` subcommand.
+</Warning>
+
+## Test placement policy
+
+| Code location | Test location | Notes |
+|---|---|---|
+| `src/basic/` | `src/test/test-<module>.c` | Unit test, self-contained |
+| `src/shared/` | `src/test/test-<module>.c` | Unit test, self-contained |
+| Higher-level features | `src/test/` | Strongly recommended |
+| System-level features | `test/TEST-*/` | Integration tests |
+
+When adding a new source file, add a matching test executable. Every module in `src/basic/` and `src/shared/` should have a corresponding unit test that exercises every helper function.
+
+## Submitting a pull request
+
+<Steps>
+
+<Step title="Make your changes">
+
+```bash
+$EDITOR src/core/main.c   # or wherever your change lives
+```
+
+</Step>
+
+<Step title="Build and test">
+
+```bash
+mkosi -f box -- meson compile -C build mkosi
+mkosi vm
+```
+
+Always test before opening a PR. The CI system will not be reviewed if the build fails or unit tests don't pass.
+
+</Step>
+
+<Step title="Stage and commit">
+
+```bash
+git add -p        # interactively stage your changes
+git commit
+```
+
+Prefix the commit subject line with the component name, for example: `core: `, `udev: `, `journal: `.
+
+</Step>
+
+<Step title="Push to your fork">
+
+```bash
+git push -u <your-remote>
+```
+
+</Step>
+
+<Step title="Open the pull request">
+
+Go to your fork on GitHub and click **Compare & pull request**.
+
+- Post PRs only relative to a recent tip of the `main` branch.
+- If you update an existing PR, force-push into the same branch and add a comment explaining the changes.
+- If your PR stalls without review, post a ping comment after some time.
+
+</Step>
+
+</Steps>
+
+<Note>
+  If you use an AI code generation tool (ChatGPT, Claude, Copilot, etc.), you must disclose this in the commit message by adding a line such as `Co-developed-by: Claude Sonnet 4.6 <noreply@anthropic.com>`. All AI-generated output requires thorough human review before submission.
+</Note>
+
+## Advanced topics
+
+<AccordionGroup>
+
+<Accordion title="Building without a tools tree">
+
+By default mkosi builds a tools tree and uses it to build the image and provide the `mkosi box` environment. To disable the tools tree and use host binaries instead, write the following to `mkosi/mkosi.local.conf`:
+
+```ini
+[Build]
+ToolsTree=
+```
+
+</Accordion>
+
+<Accordion title="Rebuilding systemd without rebuilding the OS image">
+
+After booting the image, run one of the following from another terminal on the host to rebuild and reinstall systemd without rebuilding the full image:
+
+```bash
+# Fedora / CentOS
+mkosi -R && mkosi ssh -- dnf upgrade --disablerepo="*" --assumeyes "/work/build/*.rpm"
+
+# Debian / Ubuntu
+mkosi -R && mkosi ssh -- apt-get install "/work/build/*.deb"
+
+# Arch Linux
+mkosi -R && mkosi ssh -- pacman --upgrade --needed --noconfirm "/work/build/*.pkg.tar"
+
+# openSUSE
+mkosi -R && mkosi ssh -- zypper --non-interactive install --allow-unsigned-rpm "/work/build/*.rpm"
+```
+
+Then restart the affected unit:
+
+```bash
+systemctl restart <unit>
+# or for PID 1:
+systemctl daemon-reexec
+# or to restart everything:
+systemctl soft-reboot
+```
+
+</Accordion>
+
+<Accordion title="Building distribution packages">
+
+To build distribution packages for a specific distribution and release without building a full image:
+
+```bash
+mkosi -d <distribution> -r <release> -t none -f
+```
+
+Packages are written to `build/mkosi.builddir/<distribution>~<release>~<architecture>/`.
+
+To include debuginfo packages:
+
+```bash
+mkosi -d <distribution> -r <release> -E WITH_DEBUG=1 -t none -f
+```
+
+</Accordion>
+
+<Accordion title="Developer mode vs. release mode">
+
+The default meson configuration (`-Dmode=developer`) enables checks suitable for development, including internal documentation consistency checks. When building for distribution, disable these with:
+
+```bash
+mkosi -f box -- meson setup -Dmode=release build
+```
+
+</Accordion>
+
+<Accordion title="Debugging with VSCode">
+
+After booting with `mkosi vm`, attach the VSCode debugger to the running systemd instance by creating `.vscode/launch.json`:
+
+```json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "cppdbg",
+      "program": "/usr/lib/systemd/systemd",
+      "processId": "${command:pickRemoteProcess}",
+      "request": "attach",
+      "name": "systemd",
+      "pipeTransport": {
+        "pipeProgram": "mkosi",
+        "pipeArgs": ["-C", "${workspaceFolder}", "ssh"],
+        "debuggerPath": "/usr/bin/gdb"
+      },
+      "MIMode": "gdb",
+      "sourceFileMap": {
+        "/work/src": {
+          "editorPath": "${workspaceFolder}",
+          "useForBreakpoints": false
+        }
+      }
+    }
+  ]
+}
+```
+
+To debug a component other than PID 1, set `"program"` to the full path of that component and `"processId"` to `"${command:pickProcess}"`. Use `systemctl show --property MainPID --value <component>` inside the VM to find the PID.
+
+</Accordion>
+
+<Accordion title="Using clangd with mkosi">
+
+Run `mkosi -f box true` once to ensure the tools tree is available, then configure your editor to use the `mkosi.clangd` script as the clangd binary. For VSCode:
+
+```json
+{
+  "clangd.path": "<path-to-systemd-repository>/mkosi/mkosi.clangd"
+}
+```
+
+For best results, configure the build directory to use clang:
+
+```bash
+mkosi -f box -- env CC=clang CXX=clang++ meson setup build
+```
+
+Generate all source files to avoid missing-file warnings from clangd:
+
+```bash
+mkosi -f box -- ninja -C build gensources
+```
+
+</Accordion>
+
+</AccordionGroup>

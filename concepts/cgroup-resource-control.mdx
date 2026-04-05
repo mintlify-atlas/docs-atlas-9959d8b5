@@ -1,0 +1,295 @@
+---
+title: "Resource control with cgroups"
+description: "Use systemd's cgroup v2 integration to limit CPU, memory, I/O, and task counts for services and slices. Learn about delegation, inspection tools, and the slice hierarchy."
+---
+
+systemd uses the Linux **control groups** (cgroups) kernel feature to organize processes into a hierarchical tree and apply resource limits at each node. Every service, scope, and slice unit corresponds to a cgroup directory under `/sys/fs/cgroup/`.
+
+## cgroup v2 and the unified hierarchy
+
+systemd supports the cgroup v2 **unified hierarchy**. In this mode, `/sys/fs/cgroup/` is the single mounted cgroup file system and all available controllers (`cpu`, `io`, `memory`, `pids`) are exposed through it.
+
+<Note>
+Legacy cgroup v1 mode (separate hierarchies per controller) was deprecated in systemd v256 and removed in v258. All modern systems should be running with the unified cgroup v2 hierarchy.
+</Note>
+
+Two fundamental rules govern the cgroup tree:
+
+1. **No processes in inner nodes.** A cgroup is either a leaf (containing processes) or an inner node (containing child cgroups) — not both. This rule is enforced by the kernel on cgroup v2.
+2. **Single-writer rule.** Each cgroup has exactly one manager. systemd manages the system's cgroup tree; nothing else should create or modify cgroups within it without delegation.
+
+When you set `CPUWeight=`, `MemoryMax=`, or other resource directives on a unit, systemd automatically instructs the kernel to enable the corresponding controller for that unit and all its ancestors.
+
+## The slice hierarchy
+
+systemd represents the inner nodes of the cgroup tree as **slice units** (`.slice`). By default, four slices are created:
+
+```
+-.slice                    (root slice)
+├── system.slice           (system services)
+├── user.slice             (user sessions)
+│   ├── user-1000.slice    (session for UID 1000)
+│   └── user-0.slice       (session for UID 0)
+└── machines.slice         (VMs and containers)
+```
+
+| Slice | Purpose |
+|-------|---------|
+| `-.slice` | The root of the cgroup hierarchy. Parent of all other slices. |
+| `system.slice` | Default location for system services started by systemd. |
+| `user.slice` | Contains a sub-slice per logged-in user for user sessions. |
+| `machines.slice` | Intended for VMs and containers. Used by `systemd-nspawn` by default. |
+
+A slice named `foo-bar-baz.slice` maps to the cgroup path `/foo.slice/foo-bar.slice/foo-bar-baz.slice/`. A service `quux.service` within `foo-bar-baz.slice` maps to `/foo.slice/foo-bar.slice/foo-bar-baz.slice/quux.service/`.
+
+Services are assigned to `system.slice` by default. To place a service in a different slice, set `Slice=` in the `[Service]` section:
+
+```ini
+[Service]
+Slice=database.slice
+```
+
+## Resource control directives
+
+Resource control settings are available in the `[Service]`, `[Slice]`, `[Scope]`, `[Socket]`, `[Mount]`, and `[Swap]` sections. You do not need to explicitly enable a controller — systemd does this automatically when you set a directive that requires it.
+
+### CPU
+
+<AccordionGroup>
+  <Accordion title="CPUWeight=">
+    Sets the CPU time weight for the unit relative to sibling units within the same slice. Accepts an integer from 1 to 10000, or the special value `idle`. The kernel default is 100.
+
+    CPU time is distributed proportionally: a unit with `CPUWeight=200` gets twice the CPU time of a unit with `CPUWeight=100` when both are competing for the CPU.
+
+    ```ini
+    [Service]
+    CPUWeight=200
+    ```
+
+    Controls the `cpu.weight` cgroup attribute.
+  </Accordion>
+  <Accordion title="CPUQuota=">
+    Sets an absolute upper bound on CPU usage as a percentage of one CPU. Values above 100% allow using more than one CPU core.
+
+    ```ini
+    [Service]
+    CPUQuota=50%
+    ```
+
+    Controls the `cpu.max` cgroup attribute. Unlike `CPUWeight=`, this is a hard cap — the process is throttled even if CPU time is available.
+  </Accordion>
+</AccordionGroup>
+
+### Memory
+
+<AccordionGroup>
+  <Accordion title="MemoryMin= / MemoryLow=">
+    Sets a memory usage protection threshold. When the system is under memory pressure, pages belonging to units above their `MemoryMin=` (hard protection) or `MemoryLow=` (soft protection) guarantee are not reclaimed first.
+
+    ```ini
+    [Service]
+    MemoryMin=256M
+    ```
+
+    Controls `memory.min` and `memory.low`.
+  </Accordion>
+  <Accordion title="MemoryHigh=">
+    The primary throttling limit. If memory usage exceeds this value, the kernel aggressively reclaims memory from the unit and slows down allocations. Usage can temporarily exceed this value but the unit will be penalized.
+
+    ```ini
+    [Service]
+    MemoryHigh=1G
+    ```
+
+    Controls `memory.high`. Recommended as the main memory control mechanism.
+  </Accordion>
+  <Accordion title="MemoryMax=">
+    The absolute hard limit on memory usage. If this limit is reached and memory cannot be reclaimed, the OOM killer is invoked inside the unit.
+
+    ```ini
+    [Service]
+    MemoryMax=1500M
+    ```
+
+    Controls `memory.max`. Use this as a last-resort safety net alongside `MemoryHigh=`.
+  </Accordion>
+  <Accordion title="MemorySwapMax=">
+    The absolute limit on swap space usage. Set to `0` to prevent the unit from using swap at all.
+
+    ```ini
+    [Service]
+    MemorySwapMax=0
+    ```
+
+    Controls `memory.swap.max`.
+  </Accordion>
+</AccordionGroup>
+
+### IO
+
+<AccordionGroup>
+  <Accordion title="IOWeight=">
+    Sets the relative block I/O weight for the unit. Accepts a value from 1 to 10000; the kernel default is 100. A higher weight means proportionally more I/O bandwidth when multiple units compete for the same device.
+
+    ```ini
+    [Service]
+    IOWeight=50
+    ```
+
+    Controls `io.weight`.
+  </Accordion>
+  <Accordion title="IOReadBandwidthMax= / IOWriteBandwidthMax=">
+    Sets a per-device hard bandwidth limit. Takes a device path and a bandwidth value.
+
+    ```ini
+    [Service]
+    IOReadBandwidthMax=/dev/sda 100M
+    IOWriteBandwidthMax=/dev/sda 50M
+    ```
+
+    Controls `io.max`. This is not work-conserving: the unit is throttled even if the device is otherwise idle.
+  </Accordion>
+</AccordionGroup>
+
+### Tasks
+
+`TasksMax=` limits the total number of tasks (threads + processes) in the unit. Accepts an absolute count, a percentage of the system maximum, or `infinity`.
+
+```ini
+[Service]
+TasksMax=512
+```
+
+Controls the `pids.max` cgroup attribute via the `pids` controller.
+
+## A complete example
+
+A database service with strict resource limits and placement in a dedicated slice:
+
+```ini
+# /etc/systemd/system/postgresql.service
+[Unit]
+Description=PostgreSQL Database Server
+After=network.target
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/postgres -D /var/lib/pgsql/data
+User=postgres
+Slice=database.slice
+
+# CPU: allow up to 4 cores but prefer to yield to other services
+CPUQuota=400%
+CPUWeight=80
+
+# Memory: throttle at 4 GB, hard kill at 6 GB, no swap
+MemoryHigh=4G
+MemoryMax=6G
+MemorySwapMax=0
+
+# I/O: limit write bandwidth to 200 MB/s on the data volume
+IOWriteBandwidthMax=/dev/sdb 200M
+
+# Tasks: prevent runaway connection storms
+TasksMax=1024
+
+[Install]
+WantedBy=multi-user.target
+```
+
+## Delegation
+
+**Delegation** allows a service or scope unit to take ownership of a sub-tree of the cgroup hierarchy. Container managers and nested init systems (such as a systemd instance running inside a container) require delegation to create their own cgroups.
+
+Set `Delegate=yes` on a service or scope unit to enable delegation:
+
+```ini
+[Service]
+ExecStart=/usr/bin/my-container-manager
+Delegate=yes
+```
+
+When `Delegate=yes` is set, systemd guarantees:
+
+1. systemd will not create, remove, or modify attributes of any cgroup below the delegated unit's cgroup.
+2. If `User=` is set, the cgroup sub-tree is `chown()`-ed to that user so it can create child cgroups without root privileges.
+3. Any BPF IP filter programs systemd installs will be installed with `BPF_F_ALLOW_MULTI`, allowing the delegatee to add its own BPF programs.
+
+You can also delegate specific controllers rather than all of them:
+
+```ini
+[Service]
+Delegate=cpu memory
+```
+
+<Warning>
+Delegation is only available on service and scope units. It is not supported on slice units, because slice units are inner nodes that systemd manages directly. Attempting to set `Delegate=` on a slice generates an error.
+</Warning>
+
+Once delegation is enabled, the service program can create sub-cgroups freely within its assigned cgroup. Before creating child cgroups, the main process must move itself into a sub-cgroup (due to the no-processes-in-inner-nodes rule). A common pattern is:
+
+```
+my-manager.service/
+├── supervisor/      ← the manager daemon runs here
+└── container-xyz/   ← each managed workload gets its own cgroup
+```
+
+## Inspection tools
+
+### systemd-cgls
+
+Shows the full cgroup tree as a tree diagram, with process IDs and names.
+
+```bash
+# Show the entire cgroup tree
+systemd-cgls
+
+# Show the tree under a specific unit
+systemd-cgls /system.slice/postgresql.service
+```
+
+Example output:
+
+```
+Control group /:
+-.slice
+└─system.slice
+  ├─postgresql.service
+  │ └─1234 /usr/bin/postgres -D /var/lib/pgsql/data
+  └─nginx.service
+    ├─5678 nginx: master process /usr/bin/nginx
+    └─5679 nginx: worker process
+```
+
+### systemd-cgtop
+
+Displays a live, top-like view of resource usage by cgroup, updated periodically.
+
+```bash
+# Show resource usage, refreshed every second
+systemd-cgtop
+
+# Show only CPU and memory, 5 iterations
+systemd-cgtop --iterations=5 --cpu --memory
+```
+
+The output lists each cgroup with its current CPU usage percentage, memory usage, disk I/O, and task count — sorted by CPU usage by default. Use it to identify which services are consuming the most resources at a glance.
+
+### Reading cgroup attributes directly
+
+Since the cgroup file system is mounted at `/sys/fs/cgroup/`, you can read controller attributes directly:
+
+```bash
+# Find the cgroup for a service
+systemctl show postgresql.service -p ControlGroup
+# → ControlGroup=/system.slice/postgresql.service
+
+# Read the effective memory limit
+cat /sys/fs/cgroup/system.slice/postgresql.service/memory.max
+
+# Read current memory usage
+cat /sys/fs/cgroup/system.slice/postgresql.service/memory.current
+
+# Read CPU weight
+cat /sys/fs/cgroup/system.slice/postgresql.service/cpu.weight
+```

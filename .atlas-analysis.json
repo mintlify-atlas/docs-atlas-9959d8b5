@@ -1,0 +1,132 @@
+{
+  "projectType": "infrastructure",
+  "projectName": "systemd",
+  "projectDescription": "The systemd system and service manager is the standard init system for Linux, managing the full lifecycle of services, devices, networking, logging, and boot from PID 1 onwards.",
+  "theme": "aspen",
+  "primaryColor": "#040404",
+  "lightColor": "#2ebf6c",
+  "darkColor": "#242228",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/units-and-targets",
+              "concepts/service-management",
+              "concepts/boot-process",
+              "concepts/cgroup-resource-control"
+            ]
+          },
+          {
+            "group": "Subsystems",
+            "pages": [
+              "subsystems/journald",
+              "subsystems/networkd",
+              "subsystems/resolved",
+              "subsystems/logind",
+              "subsystems/udev"
+            ]
+          },
+          {
+            "group": "Security & Credentials",
+            "pages": [
+              "security/sandboxing",
+              "security/credentials",
+              "security/portable-services"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/debugging",
+              "operations/boot-loader",
+              "operations/coredump",
+              "operations/network-online"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Developer Guide",
+        "groups": [
+          {
+            "group": "Contributing",
+            "pages": [
+              "contributing/hacking",
+              "contributing/coding-style",
+              "contributing/architecture"
+            ]
+          },
+          {
+            "group": "D-Bus & Varlink APIs",
+            "pages": [
+              "api/dbus-overview",
+              "api/libsystemd",
+              "api/sd-bus",
+              "api/sd-event"
+            ]
+          },
+          {
+            "group": "Integration",
+            "pages": [
+              "integration/writing-services",
+              "integration/daemon-socket-activation",
+              "integration/container-interface"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "PID 1 service manager with parallel service startup",
+    "systemctl — unified service and system control CLI",
+    "journald — structured binary logging with systemd-journalctl",
+    "systemd-networkd — network configuration management",
+    "systemd-resolved — DNS resolver with DNSSEC",
+    "systemd-logind — seat, session, and login management",
+    "udev — device manager and kernel event handler",
+    "systemd-boot — UEFI boot manager",
+    "Portable Services — bundled, sandboxed service images",
+    "cgroup v2 resource control and delegation",
+    "Encrypted credentials via TPM2 and /var/",
+    "sd-bus — high-level D-Bus IPC library",
+    "Varlink IPC protocol support",
+    "systemd-homed — portable home directory management",
+    "systemd-nspawn — container manager"
+  ],
+  "publicApiSurface": [
+    "systemctl — service/unit management CLI",
+    "journalctl — log query CLI",
+    "networkctl — network status and control CLI",
+    "resolvectl — DNS resolution CLI",
+    "loginctl — session and seat management CLI",
+    "busctl — D-Bus inspection and call CLI",
+    "udevadm — udev management CLI",
+    "portablectl — portable service management CLI",
+    "machinectl — machine/container management CLI",
+    "bootctl — boot manager CLI",
+    "sd_bus_* — sd-bus D-Bus IPC API (libsystemd)",
+    "sd_event_* — event loop API (libsystemd)",
+    "sd_journal_* — journal read/write API (libsystemd)",
+    "sd_notify() — service readiness notification API",
+    "sd_login_* — login session query API (libsystemd)",
+    "sd_id128_* — 128-bit ID handling API (libsystemd)",
+    "libudev — udev device enumeration C library",
+    "org.freedesktop.systemd1 D-Bus interface",
+    "org.freedesktop.resolve1 D-Bus interface",
+    "org.freedesktop.network1 D-Bus interface",
+    "org.freedesktop.login1 D-Bus interface"
+  ]
+}

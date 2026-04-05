@@ -1,80 +1,254 @@
 ---
 title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+description: "Get up and running with systemctl and journalctl. Learn the commands you'll use every day to manage services, inspect logs, and write your first unit file."
 ---
 
-## Get started in three steps
+This guide walks you through the commands you'll use most often when working with systemd. By the end, you'll know how to manage services, read logs, and write a simple service unit file.
 
-Get your documentation site running locally and make your first customization.
+## Managing services with systemctl
 
-### Step 1: Set up your local environment
+<Steps>
+  <Step title="Check the status of a service">
+    `systemctl status` shows whether a service is running, its recent log output, and its main PID:
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+    ```bash
+    systemctl status sshd.service
+    ```
 
-### Step 2: Deploy your changes
+    ```
+    ● sshd.service - OpenSSH server daemon
+         Loaded: loaded (/usr/lib/systemd/system/sshd.service; enabled; preset: enabled)
+         Active: active (running) since Sat 2026-04-04 14:32:11 UTC; 1h 2min ago
+       Main PID: 1023 (sshd)
+          Tasks: 1 (limit: 4696)
+         CGroup: /system.slice/sshd.service
+                 └─1023 "sshd: /usr/sbin/sshd -D [listener] 0 of 10-100 startups"
+    ```
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    You can omit the `.service` suffix — `systemctl status sshd` works too.
+  </Step>
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+  <Step title="Start and stop a service">
+    Start or stop a service for the current session (changes do not persist across reboots):
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+    ```bash
+    sudo systemctl start nginx.service
+    sudo systemctl stop nginx.service
+    ```
 
-### Step 3: Go live
+    To restart a running service (stop then start):
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    ```bash
+    sudo systemctl restart nginx.service
+    ```
+
+    To reload a service's configuration without interrupting existing connections (if the service supports it):
+
+    ```bash
+    sudo systemctl reload nginx.service
+    ```
+  </Step>
+
+  <Step title="Enable and disable a service">
+    Enabling a service creates the symlinks that cause it to start automatically on boot. Disabling removes them:
+
+    ```bash
+    sudo systemctl enable nginx.service
+    sudo systemctl disable nginx.service
+    ```
+
+    To enable **and** immediately start a service in one command:
+
+    ```bash
+    sudo systemctl enable --now nginx.service
+    ```
+
+    <Tip>
+      `enable` only affects boot behavior. It does not start the service right now. Use `--now` to do both at once.
+    </Tip>
+  </Step>
+
+  <Step title="List running units">
+    Show all currently active units:
+
+    ```bash
+    systemctl list-units
+    ```
+
+    Filter to a specific type:
+
+    ```bash
+    systemctl list-units --type=service
+    systemctl list-units --type=target
+    ```
+
+    Show all units including inactive and failed ones:
+
+    ```bash
+    systemctl list-units --all
+    ```
+
+    To see only units that have failed:
+
+    ```bash
+    systemctl --failed
+    ```
+  </Step>
+</Steps>
+
+## Reading logs with journalctl
+
+`journalctl` queries the structured log journal written by `systemd-journald`. Logs are stored in binary format but `journalctl` renders them as human-readable text.
+
+Show all logs since the last boot:
+
+```bash
+journalctl -b
+```
+
+Follow new log entries in real time (like `tail -f`):
+
+```bash
+journalctl -f
+```
+
+Show only logs for a specific service:
+
+```bash
+journalctl -u nginx.service
+```
+
+Combine: follow logs for a specific unit:
+
+```bash
+journalctl -fu nginx.service
+```
+
+Show logs from the previous boot (useful after a crash or reboot):
+
+```bash
+journalctl -b -1
+```
+
+Show the last 50 lines from a service:
+
+```bash
+journalctl -u sshd.service -n 50
+```
+
+Filter by priority (0=emerg through 7=debug):
+
+```bash
+journalctl -p err
+```
+
+Show full, untruncated messages:
+
+```bash
+journalctl --full
+```
+
+<Tip>
+  Add `--no-pager` to get plain output without opening `less`, which is useful in scripts:
+
+  ```bash
+  journalctl -u nginx.service --no-pager
+  ```
+</Tip>
+
+## Writing your first service unit
+
+A service unit file tells systemd how to start, stop, and manage a process. Unit files are plain text with INI-style syntax.
+
+Here is a minimal service unit for a Python web application:
+
+```ini
+[Unit]
+Description=My Python Web App
+After=network.target
+
+[Service]
+Type=simple
+User=webapp
+WorkingDirectory=/opt/myapp
+ExecStart=/opt/myapp/venv/bin/python app.py
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+```
+
+<Steps>
+  <Step title="Save the unit file">
+    Place local unit files in `/etc/systemd/system/`. Package-managed services go in `/usr/lib/systemd/system/`; files in `/etc/` take precedence over vendor files.
+
+    ```bash
+    sudo nano /etc/systemd/system/myapp.service
+    ```
+
+    Paste the unit content above, adjusting `User`, `WorkingDirectory`, and `ExecStart` for your application.
+  </Step>
+
+  <Step title="Reload the daemon">
+    After creating or modifying a unit file, tell systemd to re-read its configuration:
+
+    ```bash
+    sudo systemctl daemon-reload
+    ```
+  </Step>
+
+  <Step title="Enable and start the service">
+    ```bash
+    sudo systemctl enable --now myapp.service
+    ```
+  </Step>
+
+  <Step title="Verify it is running">
+    ```bash
+    systemctl status myapp.service
+    journalctl -fu myapp.service
+    ```
+  </Step>
+</Steps>
+
+## Unit file sections explained
+
+| Section | Purpose |
+|---------|---------|
+| `[Unit]` | Generic metadata: description, documentation, ordering (`After=`, `Before=`), and dependency declarations (`Requires=`, `Wants=`). |
+| `[Service]` | Service-specific settings: the command to run (`ExecStart=`), the user to run as (`User=`), restart behavior, environment variables, and resource limits. |
+| `[Install]` | Describes how the unit is enabled. `WantedBy=multi-user.target` is the most common value and causes the service to start in the standard multi-user boot target. |
+
+<Note>
+  The `Type=` directive tells systemd how the process signals readiness. `Type=simple` (the default) assumes the process stays in the foreground. Use `Type=notify` if your daemon calls `sd_notify(3)` to signal when it is ready, or `Type=forking` for traditional daemons that fork and exit.
+</Note>
+
+## Common systemctl commands at a glance
+
+| Command | What it does |
+|---------|-------------|
+| `systemctl status <unit>` | Show status and recent log lines |
+| `systemctl start <unit>` | Start the unit now |
+| `systemctl stop <unit>` | Stop the unit now |
+| `systemctl restart <unit>` | Stop then start |
+| `systemctl reload <unit>` | Reload configuration in-place |
+| `systemctl enable <unit>` | Enable at boot |
+| `systemctl disable <unit>` | Disable at boot |
+| `systemctl enable --now <unit>` | Enable and start immediately |
+| `systemctl list-units` | List active units |
+| `systemctl --failed` | List failed units |
+| `systemctl daemon-reload` | Re-read unit files after changes |
+| `systemctl is-active <unit>` | Print "active" or "inactive" (exit code 0/1) |
+| `systemctl is-enabled <unit>` | Print "enabled" or "disabled" (exit code 0/1) |
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Installation & build" icon="wrench" href="/installation">
+    Install systemd from your distribution's packages or build from source.
+  </Card>
+  <Card title="Units and targets" icon="boxes-stacked" href="/concepts/units-and-targets">
+    Learn how unit files work and how targets organize the boot process.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

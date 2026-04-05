@@ -1,0 +1,299 @@
+---
+title: "Network synchronization"
+description: "Understand the three network targets in systemd, when to use network-online.target, and how to configure systemd-networkd-wait-online and NetworkManager for your service's network requirements."
+---
+
+systemd provides three targets that represent different stages of network readiness. Choosing the right one—and understanding what each actually guarantees—prevents both unnecessary boot delays and subtle ordering bugs.
+
+---
+
+## The three network targets
+
+<CardGroup cols={1}>
+  <Card title="network-pre.target" icon="shield">
+    **Purpose:** Order services *before* any network interfaces are configured.
+
+    Primary use case: firewall services that must establish rules before any interface comes up.
+
+    `network-pre.target` is **passive** — it is not pulled in by the network management service itself. A service that needs to run before the network is configured must explicitly pull it in:
+
+    ```ini
+    [Unit]
+    Before=network-pre.target
+    Wants=network-pre.target
+    ```
+
+    Network management services should set `After=network-pre.target` but must not set `Wants=` or `Requires=` on it. This avoids pulling in the synchronization point unless something actually needs it.
+  </Card>
+
+  <Card title="network.target" icon="network-wired">
+    **Purpose:** Indicate that the network management stack has started.
+
+    This target does **not** guarantee that any interface is configured or that any IP address has been assigned. Its value is primarily in **shutdown ordering**: because shutdown reverses startup ordering, a unit with `After=network.target` will be stopped before the network goes down, allowing it to close connections cleanly.
+
+    `network.target` is **passive** — it is pulled in by the network management service (e.g., `NetworkManager.service`, `systemd-networkd.service`) and does not need to be explicitly pulled in by services that use the network.
+
+    ```ini
+    # Correct: allows clean shutdown before network disappears
+    [Unit]
+    After=network.target
+    ```
+  </Card>
+
+  <Card title="network-online.target" icon="globe">
+    **Purpose:** Actively wait until the network is "up" as defined by the active network management software.
+
+    This typically means at least one interface has a configured, routable IP address. The exact definition depends on which wait service is enabled.
+
+    `network-online.target` is **active** — services that need connectivity must pull it in explicitly:
+
+    ```ini
+    [Unit]
+    After=network-online.target
+    Wants=network-online.target
+    ```
+
+    This target times out after **90 seconds**. Enabling it can significantly delay boot if the network is slow to come up.
+  </Card>
+</CardGroup>
+
+---
+
+## When to use network-online.target
+
+<Warning>
+  Do not add `After=network-online.target` by default. Most services do not need it and it unnecessarily delays boot.
+</Warning>
+
+### Use it when
+
+- Your service **cannot start at all** without a routable network address (e.g., a network filesystem client, a VPN tunnel that must connect before anything else).
+- Your service starts an action at boot that requires network and does not retry on failure (e.g., a one-shot download job).
+
+### Do not use it when
+
+- Your service is a **network server** — servers are typically happy to accept connections on `[::]` or `0.0.0.0` and do not need a specific address to be pre-assigned.
+- Your service **handles network loss gracefully** — well-written daemons watch `rtnetlink` and adapt to changing network configuration without a restart.
+- Your service uses `IP_FREEBIND` / `FreeBind=yes` — this allows binding to addresses not yet assigned.
+
+### The better approach for most services
+
+Write services to be robust against dynamic network changes:
+
+1. Watch `rtnetlink` and react to interface up/down events.
+2. Bind to `0.0.0.0` or `[::]` so the listen address is always available.
+3. Retry failed connections with exponential backoff.
+
+A service written this way starts immediately, works on all networks, and never delays boot.
+
+---
+
+## How wait-online services work
+
+`network-online.target` is only meaningful if a wait service is enabled and ordered before it. The two common implementations are:
+
+<Tabs>
+  <Tab title="systemd-networkd">
+    `systemd-networkd-wait-online.service` waits until all interfaces managed by `systemd-networkd` are fully configured or have failed, and at least one link is online.
+
+    It is automatically enabled when `systemd-networkd.service` is enabled (via `Also=` in its `[Install]` section). You do not need to enable it separately.
+
+    ```bash
+    # Verify that the right service is enabled
+    systemctl is-enabled systemd-networkd-wait-online.service
+    ```
+
+    **The `--any` flag:** By default, `systemd-networkd-wait-online` waits for *all* managed interfaces. Use `--any` to consider the target reached as soon as *any* interface is online. Override the service arguments with a drop-in:
+
+    ```ini
+    # /etc/systemd/system/systemd-networkd-wait-online.service.d/override.conf
+    [Service]
+    ExecStart=
+    ExecStart=/usr/lib/systemd/systemd-networkd-wait-online --any
+    ```
+
+    Per-link requirements are configured in `.network` files using `RequiredForOnline=` and `RequiredFamilyForOnline=`:
+
+    ```ini
+    # /etc/systemd/network/10-eth0.network
+    [Match]
+    Name=eth0
+
+    [Network]
+    DHCP=yes
+
+    [Link]
+    RequiredForOnline=yes
+    RequiredFamilyForOnline=ipv4
+    ```
+
+    To mark an interface as not required for online status:
+
+    ```ini
+    [Link]
+    RequiredForOnline=no
+    ```
+  </Tab>
+  <Tab title="NetworkManager">
+    `NetworkManager-wait-online.service` is provided by NetworkManager and waits until NetworkManager reports connectivity.
+
+    Like its counterpart, it is automatically enabled when `NetworkManager.service` is enabled. You do not need to enable it separately.
+
+    ```bash
+    # Verify that the right service is enabled
+    systemctl is-enabled NetworkManager-wait-online.service
+    ```
+
+    Only one wait service should be enabled at a time. Verify:
+
+    ```bash
+    systemctl is-enabled NetworkManager-wait-online.service systemd-networkd-wait-online.service
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Checking network readiness
+
+Use `networkctl` to wait for a specific interface or for any interface to come online:
+
+```bash
+# Wait for all managed interfaces to be online
+networkctl wait-online
+
+# Wait for a specific interface
+networkctl wait-online --interface=eth0
+
+# Consider done when any interface is online
+networkctl wait-online --any
+
+# Set a maximum wait time of 30 seconds
+networkctl wait-online --timeout=30
+
+# Wait for a specific operational state
+networkctl wait-online --operational-state=routable
+```
+
+The `--timeout` flag causes the command to exit with a non-zero status if the condition is not met within the specified number of seconds. Use it in scripts to avoid hanging indefinitely.
+
+---
+
+## Ordering your service correctly
+
+<Steps>
+  <Step title="Determine what your service actually needs">
+    Does it need *any* network stack started (`network.target`), *full connectivity* (`network-online.target`), or does it need to run *before* any interface comes up (`network-pre.target`)?
+  </Step>
+  <Step title="Write the correct unit ordering">
+    For a client that genuinely needs connectivity before it can do anything:
+
+    ```ini
+    [Unit]
+    Description=My network client
+    After=network-online.target
+    Wants=network-online.target
+
+    [Service]
+    ExecStart=/usr/local/bin/myclient
+    Restart=on-failure
+    ```
+
+    For a server that listens on all interfaces:
+
+    ```ini
+    [Unit]
+    Description=My network server
+    After=network.target
+
+    [Service]
+    ExecStart=/usr/local/bin/myserver
+    Restart=on-failure
+    ```
+  </Step>
+  <Step title="Verify the wait service is enabled">
+    ```bash
+    systemctl is-enabled systemd-networkd-wait-online.service
+    # or
+    systemctl is-enabled NetworkManager-wait-online.service
+    ```
+
+    If neither is enabled, `network-online.target` is reached immediately and provides no guarantee.
+  </Step>
+  <Step title="Check for boot delays">
+    ```bash
+    systemd-analyze blame | grep -E "network|wait-online"
+    systemd-analyze critical-chain network-online.target
+    ```
+
+    If `systemd-networkd-wait-online.service` or `NetworkManager-wait-online.service` appears near the top of `blame` output, consider whether your service actually needs the full wait or could start earlier.
+  </Step>
+</Steps>
+
+---
+
+## Extending network-online.target
+
+You can add custom readiness checks by creating a service that orders itself before `network-online.target`. For example, to delay the target until a specific host is resolvable:
+
+```ini
+# /etc/systemd/system/wait-for-example.service
+[Unit]
+Description=Wait until example.com is reachable
+DefaultDependencies=no
+After=nss-lookup.target
+Before=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=sh -c 'until ping -c 1 example.com; do sleep 1; done'
+
+[Install]
+WantedBy=network-online.target
+```
+
+Enable and start it:
+
+```bash
+systemctl enable --now wait-for-example.service
+```
+
+Now `network-online.target` will not be reached until `example.com` responds to a ping.
+
+<Warning>
+  Extending `network-online.target` with slow or unreliable checks (DNS resolution, external pings) can cause the target to time out after 90 seconds or block boot indefinitely on offline systems. Always add a timeout or a loop bound to your check.
+</Warning>
+
+---
+
+## Common misconfigurations
+
+<AccordionGroup>
+  <Accordion title="Adding network-online.target to every service">
+    This is the most common mistake. Most services are not actually broken without a pre-established network connection. The result is that all such services are serialized behind the slowest network bring-up path, dramatically increasing boot time on systems with slow DHCP or no network at all.
+  </Accordion>
+
+  <Accordion title="No wait service enabled">
+    If neither `systemd-networkd-wait-online.service` nor `NetworkManager-wait-online.service` is enabled, `network-online.target` is reached as soon as the network management service starts — before any interface is configured. Adding `After=network-online.target` to a service in this state provides no real ordering guarantee.
+  </Accordion>
+
+  <Accordion title="Both wait services enabled simultaneously">
+    Having both `NetworkManager-wait-online.service` and `systemd-networkd-wait-online.service` enabled at the same time is unusual and likely means one of the two network management stacks is not actually in use. Check which is active:
+
+    ```bash
+    systemctl is-active NetworkManager systemd-networkd
+    ```
+
+    Disable the wait service for the inactive manager.
+  </Accordion>
+
+  <Accordion title="network-online.target not pulled in">
+    `network-online.target` is not pulled into boot by default. Simply adding `After=network-online.target` without also adding `Wants=network-online.target` means the target may never be activated, and the ordering has no effect. Always pair them:
+
+    ```ini
+    After=network-online.target
+    Wants=network-online.target
+    ```
+  </Accordion>
+</AccordionGroup>

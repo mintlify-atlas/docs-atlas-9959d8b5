@@ -1,0 +1,267 @@
+---
+title: "systemd-journald"
+description: "Binary structured log collection daemon that aggregates kernel messages, syslog output, service stdout/stderr, and native journal entries into a single queryable store."
+---
+
+`systemd-journald` is the logging daemon at the center of systemd's observability story. It collects log data from multiple sources, stores entries in a binary structured format with rich metadata, and exposes them for querying through `journalctl` and the native C API.
+
+## What journald collects
+
+<CardGroup cols={2}>
+  <Card title="Kernel messages" icon="microchip">
+    All output from the kernel ring buffer (equivalent to `dmesg`), captured automatically.
+  </Card>
+  <Card title="Syslog socket" icon="plug">
+    Messages sent to `/dev/log` by legacy syslog-aware applications.
+  </Card>
+  <Card title="Service stdout/stderr" icon="terminal">
+    Standard output and error of every systemd service unit, connected automatically.
+  </Card>
+  <Card title="Native journal entries" icon="code">
+    Structured entries submitted via the `sd_journal_send()` C API or the `systemd-cat` helper.
+  </Card>
+</CardGroup>
+
+All sources are stored together in a single journal with nanosecond timestamps, per-field indexing, and optional cryptographic sealing.
+
+---
+
+## Querying with journalctl
+
+`journalctl` reads the journal files maintained by `systemd-journald.service` and prints matching entries.
+
+### Common filters
+
+<Tabs>
+  <Tab title="By unit">
+    ```bash
+    # Show logs for a specific service
+    journalctl -u nginx.service
+
+    # Follow live (like tail -f)
+    journalctl -u nginx.service -f
+    ```
+  </Tab>
+  <Tab title="By time">
+    ```bash
+    # Entries since a point in time
+    journalctl --since "2024-01-15 08:00:00"
+
+    # Entries within a time range
+    journalctl --since "1 hour ago" --until "30 min ago"
+
+    # Current boot only
+    journalctl -b
+    ```
+  </Tab>
+  <Tab title="By priority">
+    ```bash
+    # Errors and above (0=emerg … 7=debug)
+    journalctl -p err
+
+    # Range of priorities
+    journalctl -p warning..err
+    ```
+  </Tab>
+  <Tab title="Output formats">
+    ```bash
+    # JSON output (one object per line)
+    journalctl -o json
+
+    # Compact JSON (entire stream as array)
+    journalctl -o json-pretty
+
+    # Short one-line format (default)
+    journalctl -o short
+
+    # Full verbose output with all fields
+    journalctl -o verbose
+    ```
+  </Tab>
+</Tabs>
+
+### Field-based matching
+
+Entries can be filtered by any journal field using `FIELD=VALUE` positional arguments:
+
+```bash
+# All entries from a specific executable
+journalctl _SYSTEMD_UNIT=sshd.service
+
+# Combine filters (AND): unit + priority
+journalctl -u sshd.service -p err
+
+# OR between values of the same field
+journalctl _SYSTEMD_UNIT=nginx.service _SYSTEMD_UNIT=php-fpm.service
+
+# OR between different field matches (+ separator)
+journalctl _SYSTEMD_UNIT=nginx.service + _PID=1234
+```
+
+---
+
+## Configuration
+
+The journal daemon is configured at `/etc/systemd/journald.conf`. Drop-in files are read from `/etc/systemd/journald.conf.d/*.conf`.
+
+All options live in the `[Journal]` section.
+
+### Storage settings
+
+```ini
+[Journal]
+# Where to persist journal data
+# volatile  – RAM only (/run/log/journal)
+# persistent – disk (/var/log/journal, created if missing)
+# auto       – persistent if /var/log/journal exists, otherwise volatile
+# none       – discard all data (forwarding still works)
+Storage=auto
+
+# Maximum disk space the journal may consume
+SystemMaxUse=500M
+
+# Minimum free space to leave on the filesystem
+SystemKeepFree=1G
+
+# Delete entries older than this
+MaxRetentionSec=1month
+
+# Maximum size of a single journal file before rotation
+SystemMaxFileSize=50M
+```
+
+<Note>
+  `SystemMaxUse=` and `SystemKeepFree=` both apply simultaneously — journald respects the stricter of the two limits. Defaults are 10% and 15% of the filesystem size, each capped at 4 GB.
+</Note>
+
+### Rate limiting
+
+```ini
+[Journal]
+# Drop messages from a service after this many messages…
+RateLimitBurst=10000
+# …in this time window
+RateLimitIntervalSec=30s
+```
+
+### Forwarding options
+
+```ini
+[Journal]
+# Forward to the kernel log buffer (visible via dmesg)
+ForwardToKMsg=no
+
+# Forward to the local syslog socket
+ForwardToSyslog=yes
+
+# Forward to the system console
+ForwardToConsole=no
+
+# Forward to the wall terminal (all logged-in users)
+ForwardToWall=yes
+```
+
+---
+
+## Journal fields
+
+Every journal entry is a set of key-value fields. Well-known fields:
+
+| Field | Description |
+|---|---|
+| `MESSAGE` | The human-readable log message |
+| `PRIORITY` | Syslog priority integer (0–7) |
+| `_SYSTEMD_UNIT` | The systemd unit that generated the entry |
+| `_PID` | Process ID of the logging process |
+| `SYSLOG_IDENTIFIER` | Syslog program name (e.g. `nginx`) |
+| `_COMM` | Command name of the process |
+| `_EXE` | Path to the executable |
+| `_HOSTNAME` | Hostname |
+| `_BOOT_ID` | Boot ID (changes each reboot) |
+
+Fields prefixed with `_` are trusted fields set by journald itself; unprefixed fields come from the application.
+
+---
+
+## Native journal API
+
+Applications can submit structured entries directly to the journal using `libsystemd`.
+
+### sd_journal_print
+
+```c
+#include <systemd/sd-journal.h>
+#include <syslog.h>
+#include <unistd.h>
+
+int main(void) {
+    /* Simple printf-style logging */
+    sd_journal_print(LOG_INFO, "Server started on PID %lu", (unsigned long) getpid());
+
+    /* Log an error */
+    sd_journal_print(LOG_ERR, "Failed to open configuration file: %s", "/etc/app/config.toml");
+
+    return 0;
+}
+```
+
+### sd_journal_send (structured fields)
+
+```c
+#include <systemd/sd-journal.h>
+#include <syslog.h>
+
+int main(void) {
+    /* Submit structured fields — variable names must be uppercase */
+    sd_journal_send(
+        "MESSAGE=Connection accepted from 192.168.1.42",
+        "PRIORITY=%i", LOG_INFO,
+        "CLIENT_IP=192.168.1.42",
+        "CLIENT_PORT=54321",
+        "SYSLOG_IDENTIFIER=myapp",
+        NULL  /* must be NULL-terminated */
+    );
+
+    return 0;
+}
+```
+
+Compile with `-lsystemd` (or use `pkg-config --libs libsystemd`).
+
+<Tip>
+  `sd_journal_send()` automatically adds `CODE_FILE=`, `CODE_LINE=`, and `CODE_FUNC=` fields pointing to the call site. Define `SD_JOURNAL_SUPPRESS_LOCATION` before including `sd-journal.h` to suppress this.
+</Tip>
+
+---
+
+## Remote journal collection
+
+Logs can be forwarded to a central host using two companion services:
+
+<AccordionGroup>
+  <Accordion title="systemd-journal-remote">
+    Receives journal entries over HTTPS on the collection host. Writes them to separate `.journal` files under `/var/log/journal/remote/`.
+
+    ```bash
+    # On the receiving host
+    systemctl enable --now systemd-journal-remote.socket
+    ```
+  </Accordion>
+  <Accordion title="systemd-journal-upload">
+    Runs on the sending host and pushes entries to a `systemd-journal-remote` endpoint.
+
+    ```bash
+    # /etc/systemd/journal-upload.conf
+    [Upload]
+    URL=https://logs.example.com:19532
+    ```
+
+    ```bash
+    systemctl enable --now systemd-journal-upload.service
+    ```
+  </Accordion>
+</AccordionGroup>
+
+<Note>
+  `systemd-journal-upload` tracks the upload cursor, so it resumes from where it left off after restarts or network outages.
+</Note>

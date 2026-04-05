@@ -1,0 +1,277 @@
+---
+title: "udev — Device Manager"
+description: "Dynamic device node manager that receives kernel uevents, applies rules to identify and configure devices, populates /dev, and assigns predictable network interface names."
+---
+
+`udev` is the device manager for the Linux kernel. When the kernel detects hardware changes — a USB device plugged in, a storage device appearing, a network card enumerated — it emits a uevent. The `systemd-udevd` daemon receives these events, matches them against a set of rules, and takes appropriate action: creating device nodes in `/dev`, setting permissions, creating symlinks, renaming network interfaces, running helper programs, and updating the udev database.
+
+---
+
+## How it works
+
+<Steps>
+  <Step title="Kernel emits uevent">
+    When a device is added, removed, or changes state, the kernel sends a uevent via a netlink socket. The event includes the device's subsystem, device type, and sysfs path.
+  </Step>
+  <Step title="udevd receives and queues the event">
+    `systemd-udevd` receives the event, spawns a worker process, and begins evaluating rules against the device's attributes.
+  </Step>
+  <Step title="Rules are applied">
+    Rules are read from rule files in lexicographic order. Each rule is a list of match conditions and assignment actions. When all conditions in a rule match, the assignments are applied.
+  </Step>
+  <Step title="/dev is populated">
+    Based on the rule results, udevd creates or removes device nodes, sets ownership and permissions, and creates symlinks in `/dev`. The device record is stored in the udev database.
+  </Step>
+  <Step title="Event subscribers are notified">
+    Applications listening to the udev monitor socket (via libudev) receive the event and the device's final properties.
+  </Step>
+</Steps>
+
+---
+
+## Rule file locations
+
+Rules are loaded from the following directories, in order of precedence (higher overrides lower):
+
+| Directory | Purpose |
+|---|---|
+| `/etc/udev/rules.d/` | Local administration rules — highest priority |
+| `/run/udev/rules.d/` | Runtime rules (ephemeral) |
+| `/usr/local/lib/udev/rules.d/` | Locally installed package rules |
+| `/usr/lib/udev/rules.d/` | Distribution-provided rules — lowest priority |
+
+Files with identical names replace each other; a symlink to `/dev/null` in `/etc/udev/rules.d/` disables a file from a lower-priority directory. Rule files must use the `.rules` extension.
+
+---
+
+## Rules syntax
+
+Every non-blank, non-comment line in a rules file is a comma-separated list of key-operator-value expressions.
+
+### Operators
+
+| Operator | Meaning |
+|---|---|
+| `==` | Match: key equals value |
+| `!=` | Match: key does not equal value |
+| `=` | Assign: set key to value |
+| `+=` | Assign: append value to a list key |
+| `-=` | Assign: remove value from a list key |
+| `:=` | Assign: set and lock (no further rules can change it) |
+
+### Common match keys
+
+| Key | Matches on |
+|---|---|
+| `ACTION` | `add`, `remove`, `change`, `bind`, `unbind` |
+| `SUBSYSTEM` | Kernel subsystem (e.g. `usb`, `block`, `net`) |
+| `KERNEL` | Kernel device name (e.g. `sd*`, `ttyUSB*`) |
+| `ATTR{filename}` | A sysfs attribute value |
+| `ENV{key}` | A device property (udev environment variable) |
+| `DRIVER` | The kernel driver bound to the device |
+
+### Common assignment keys
+
+| Key | Effect |
+|---|---|
+| `NAME` | Set the network interface name |
+| `SYMLINK+=` | Create a symlink in `/dev` pointing to the device node |
+| `OWNER`, `GROUP`, `MODE` | Set device node ownership and permissions |
+| `RUN+=` | Run a program as part of event handling |
+| `ENV{key}=` | Set a device property in the udev database |
+| `TAG+=` | Attach a tag to the device (e.g. `uaccess`, `seat`) |
+| `LABEL` | Define a jump target |
+| `GOTO` | Jump to a `LABEL` |
+
+---
+
+## Writing custom rules
+
+### USB device symlink
+
+Create a stable symlink for a USB serial adapter:
+
+```ini
+# /etc/udev/rules.d/99-usb-serial.rules
+
+# Match a specific USB serial device by vendor and product ID
+ACTION=="add", SUBSYSTEM=="tty", \
+  ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", \
+  SYMLINK+="arduino"
+```
+
+After adding the rule, the device appears as both `/dev/ttyUSB0` (or similar) and `/dev/arduino`.
+
+### Set permissions for a device group
+
+```ini
+# /etc/udev/rules.d/70-dialout.rules
+ACTION=="add", SUBSYSTEM=="tty", KERNEL=="ttyUSB*", \
+  GROUP="dialout", MODE="0664"
+```
+
+### Run a script on device appearance
+
+```ini
+# /etc/udev/rules.d/80-usb-mount.rules
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_FS_TYPE}=="vfat", \
+  RUN+="/usr/local/bin/automount.sh %k"
+```
+
+<Warning>
+  Programs invoked via `RUN+=` run in a minimal environment with a short timeout. They must not block. For longer work, use `RUN+="systemd-run ..."` to hand off to a transient service.
+</Warning>
+
+---
+
+## udevadm
+
+`udevadm` is the management tool for `systemd-udevd`. It queries the device database, monitors events, tests rules, and controls the daemon.
+
+### info — query the database
+
+```bash
+# Show all properties for a device node
+udevadm info /dev/sda
+
+# Show the sysfs path for a device
+udevadm info --query=path /dev/sda
+
+# Show all symlinks for a device
+udevadm info --query=symlink /dev/disk/by-id/...
+
+# Walk up the device tree
+udevadm info --attribute-walk /dev/ttyUSB0
+```
+
+### monitor — watch events in real time
+
+```bash
+# Show kernel uevents and udev events as they arrive
+udevadm monitor
+
+# Show only kernel events
+udevadm monitor --kernel
+
+# Show only udev events (after rules are applied)
+udevadm monitor --udev
+```
+
+### trigger — replay events
+
+```bash
+# Replay add events for all block devices
+udevadm trigger --subsystem-match=block
+
+# Replay events for a specific device
+udevadm trigger /dev/sdb
+
+# Wait for all queued events to be processed
+udevadm settle
+```
+
+### control — manage the daemon
+
+```bash
+# Reload all rule files (no restart needed)
+udevadm control --reload
+
+# Set the log level
+udevadm control --log-level=debug
+
+# Stop processing new events (drain the queue first)
+udevadm control --stop-exec-queue
+udevadm control --start-exec-queue
+```
+
+### test — dry-run rules against a device
+
+```bash
+# Test which rules would apply to a device (does not write to database)
+udevadm test /sys/class/net/eth0
+
+# Test a specific built-in command
+udevadm test-builtin net_id /sys/class/net/eth0
+```
+
+<Tip>
+  `udevadm test` is the fastest way to debug why a rule is or is not matching. It prints every rule file and condition evaluated for the device.
+</Tip>
+
+---
+
+## Predictable network interface names
+
+Starting with systemd v197, `udev` assigns stable, predictable names to network interfaces instead of the unpredictable `eth0`, `eth1` sequence assigned by the kernel.
+
+### Naming policies (applied in order)
+
+| Scheme | Example | Source |
+|---|---|---|
+| Firmware/BIOS index for on-board devices | `eno1` | BIOS-provided index |
+| Firmware/BIOS PCIe hotplug slot index | `ens1` | BIOS slot number |
+| Physical/geographical PCI location | `enp2s0` | PCI bus, slot, function |
+| MAC address | `enx78e7d1ea46da` | Interface MAC address |
+| Kernel-native (fallback) | `eth0` | Kernel discovery order |
+
+**Name prefix meanings:**
+
+| Prefix | Type |
+|---|---|
+| `en` | Ethernet |
+| `wl` | WLAN |
+| `ww` | WWAN (mobile broadband) |
+| `lo` | Loopback |
+
+So `enp2s0` is an **en**thernet interface on PCI bus **p2**, slot **s0**.
+
+### Opting out
+
+<AccordionGroup>
+  <Accordion title="Disable predictable names entirely">
+    ```bash
+    ln -s /dev/null /etc/systemd/network/99-default.link
+    ```
+
+    This masks the default `.link` file, causing the kernel's original names (`eth0`, etc.) to be used.
+  </Accordion>
+  <Accordion title="Assign custom names via .link files">
+    ```ini
+    # /etc/systemd/network/10-rename.link
+    [Match]
+    MACAddress=aa:bb:cc:dd:ee:ff
+
+    [Link]
+    Name=internet0
+    ```
+  </Accordion>
+  <Accordion title="Kernel command line">
+    Pass `net.ifnames=0` on the kernel command line (e.g. in GRUB) to disable predictable names for all interfaces.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Hardware database (hwdb)
+
+The hardware database maps device attributes to properties, providing human-readable descriptions and additional metadata. It is compiled from plain-text files under `/usr/lib/udev/hwdb.d/` and `/etc/udev/hwdb.d/`.
+
+```bash
+# Recompile the binary database after editing hwdb files
+systemd-hwdb update
+
+# Query the database for a device
+udevadm hwdb --test=usb:v046Dp0825
+```
+
+Custom entries follow the format:
+
+```
+# /etc/udev/hwdb.d/99-custom.hwdb
+# Match pattern (modalias-style)
+usb:v046Dp0825*
+ ID_INPUT_KEYBOARD=1
+ KEYBOARD_KEY_70039=capslock
+```
+
+After editing, run `systemd-hwdb update && udevadm trigger` to apply.

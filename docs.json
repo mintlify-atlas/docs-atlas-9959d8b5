@@ -1,122 +1,109 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mint Starter Kit",
+  "name": "systemd",
+  "theme": "aspen",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#040404",
+    "light": "#2ebf6c",
+    "dark": "#242228"
   },
-  "favicon": "/favicon.svg",
+  "favicon": "https://media.brand.dev/51b5a19d-333b-4a22-897e-761ff4d41829.png",
+  "logo": {
+    "light": "https://media.brand.dev/c2e442ef-1fba-489a-8827-a7b07208fee4.svg",
+    "dark": "https://media.brand.dev/c2e442ef-1fba-489a-8827-a7b07208fee4.svg"
+  },
+  "navbar": {
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/systemd/systemd"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/systemd/systemd"
+    }
+  },
   "navigation": {
     "tabs": [
       {
-        "tab": "Guides",
+        "tab": "Documentation",
         "groups": [
           {
-            "group": "Getting started",
+            "group": "Get Started",
             "pages": [
-              "index",
+              "introduction",
               "quickstart",
-              "development"
+              "installation"
             ]
           },
           {
-            "group": "Customization",
+            "group": "Core Concepts",
             "pages": [
-              "essentials/settings",
-              "essentials/navigation"
+              "concepts/units-and-targets",
+              "concepts/service-management",
+              "concepts/boot-process",
+              "concepts/cgroup-resource-control"
             ]
           },
           {
-            "group": "Writing content",
+            "group": "Subsystems",
             "pages": [
-              "essentials/markdown",
-              "essentials/code",
-              "essentials/images",
-              "essentials/reusable-snippets"
+              "subsystems/journald",
+              "subsystems/networkd",
+              "subsystems/resolved",
+              "subsystems/logind",
+              "subsystems/udev"
             ]
           },
           {
-            "group": "AI tools",
+            "group": "Security & Credentials",
             "pages": [
-              "ai-tools/cursor",
-              "ai-tools/claude-code",
-              "ai-tools/windsurf"
+              "security/sandboxing",
+              "security/credentials",
+              "security/portable-services"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/debugging",
+              "operations/boot-loader",
+              "operations/coredump",
+              "operations/network-online"
             ]
           }
         ]
       },
       {
-        "tab": "API reference",
+        "tab": "Developer Guide",
         "groups": [
           {
-            "group": "API documentation",
+            "group": "Contributing",
             "pages": [
-              "api-reference/introduction"
+              "contributing/hacking",
+              "contributing/coding-style",
+              "contributing/architecture"
             ]
           },
           {
-            "group": "Endpoint examples",
+            "group": "D-Bus & Varlink APIs",
             "pages": [
-              "api-reference/endpoint/get",
-              "api-reference/endpoint/create",
-              "api-reference/endpoint/delete",
-              "api-reference/endpoint/webhook"
+              "api/dbus-overview",
+              "api/libsystemd",
+              "api/sd-bus",
+              "api/sd-event"
+            ]
+          },
+          {
+            "group": "Integration",
+            "pages": [
+              "integration/writing-services",
+              "integration/daemon-socket-activation",
+              "integration/container-interface"
             ]
           }
         ]
       }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
-  },
-  "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
-    "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://dashboard.mintlify.com"
-    }
-  },
-  "contextual": {
-    "options": [
-     "copy",
-     "view",
-     "chatgpt",
-     "claude",
-     "perplexity",
-     "mcp",
-     "cursor",
-     "vscode"
-   ]
-  },
-  "footer": {
-    "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
-    }
+    ]
   }
 }

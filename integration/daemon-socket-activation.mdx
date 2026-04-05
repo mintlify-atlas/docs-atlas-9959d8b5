@@ -1,0 +1,344 @@
+---
+title: "Socket Activation"
+description: "How systemd opens sockets before services start, passes file descriptors via environment variables, and enables lazy startup and zero-downtime restarts."
+---
+
+Socket activation is a technique where systemd opens and binds a socket on behalf of a service, then starts the service only when the first connection or datagram arrives. The socket is passed to the service as an already-open file descriptor.
+
+<CardGroup cols={2}>
+  <Card title="Lazy startup" icon="clock">
+    Services are not started at boot time. The first connection triggers startup automatically.
+  </Card>
+  <Card title="Zero-downtime restart" icon="rotate-right">
+    While a service restarts, systemd holds the socket. Clients can connect; their connections queue until the new process is ready.
+  </Card>
+  <Card title="Parallel activation" icon="bolt">
+    All services can be activated simultaneously at boot without dependency ordering, because their sockets are already listening.
+  </Card>
+  <Card title="Per-connection instances" icon="clone">
+    With `Accept=yes`, systemd spawns a separate service instance for every incoming connection.
+  </Card>
+</CardGroup>
+
+## How it works
+
+<Steps>
+  <Step title="systemd opens and binds the socket">
+    systemd reads the `.socket` unit file, creates the socket, binds it to the configured address, and calls `listen()`. The socket is held by systemd, not the service.
+  </Step>
+  <Step title="A connection arrives">
+    When the first connection or datagram arrives (or when the socket unit is started explicitly), systemd starts the paired `.service` unit.
+  </Step>
+  <Step title="File descriptors are passed to the service">
+    systemd passes the open socket file descriptors to the service process. They start at file descriptor number 3 (`SD_LISTEN_FDS_START`). Two environment variables tell the service how many descriptors were passed and which process they belong to.
+  </Step>
+  <Step title="The service calls sd_listen_fds()">
+    The service calls `sd_listen_fds()` to learn how many file descriptors were passed, then uses them as already-open, already-bound, already-listening sockets.
+  </Step>
+</Steps>
+
+## Environment variables
+
+systemd sets the following variables in the service environment:
+
+| Variable | Description |
+|---|---|
+| `LISTEN_FDS` | Number of file descriptors passed. The first is always fd 3. |
+| `LISTEN_PID` | PID the file descriptors were passed to. `sd_listen_fds()` checks this to avoid acting on stale variables inherited by child processes. |
+| `LISTEN_FDNAMES` | Colon-separated list of names for the passed file descriptors, corresponding to `FileDescriptorName=` in the socket unit. |
+
+<Warning>
+Always verify `LISTEN_PID` matches your process before using the file descriptors. `sd_listen_fds()` does this automatically; if you implement the check manually, compare `LISTEN_PID` to `getpid()`.
+</Warning>
+
+## The sd_listen_fds() API
+
+```c
+#include <systemd/sd-daemon.h>
+
+// SD_LISTEN_FDS_START is defined as 3
+// #define SD_LISTEN_FDS_START 3
+
+int n = sd_listen_fds(0);  // 0 = don't unset environment variables
+if (n < 0) {
+    fprintf(stderr, "Failed to receive sockets: %s\n", strerror(-n));
+    return EXIT_FAILURE;
+}
+if (n == 0) {
+    // Not socket-activated; open sockets manually
+}
+
+// Use file descriptors starting at SD_LISTEN_FDS_START
+for (int i = 0; i < n; i++) {
+    int fd = SD_LISTEN_FDS_START + i;
+    // use fd...
+}
+```
+
+`sd_listen_fds()` returns the number of passed file descriptors (zero if none), or a negative errno on failure. It also sets `FD_CLOEXEC` on all passed descriptors so they are not accidentally inherited by child processes.
+
+### Checking socket type
+
+If your service can receive multiple descriptors, use `sd_is_socket()` and related helpers to identify each one:
+
+```c
+#include <systemd/sd-daemon.h>
+#include <sys/socket.h>
+
+int n = sd_listen_fds(0);
+for (int i = 0; i < n; i++) {
+    int fd = SD_LISTEN_FDS_START + i;
+
+    if (sd_is_socket(fd, AF_INET6, SOCK_STREAM, 1) > 0) {
+        // IPv6 TCP socket, listening
+    } else if (sd_is_socket_unix(fd, SOCK_STREAM, 1, "/run/myapp.sock", 0) > 0) {
+        // Unix stream socket at a specific path
+    } else if (sd_is_socket(fd, AF_UNSPEC, SOCK_DGRAM, -1) > 0) {
+        // Any datagram socket
+    }
+}
+```
+
+| Function | Checks |
+|---|---|
+| `sd_is_socket(fd, family, type, listening)` | Address family, socket type, and listening state |
+| `sd_is_socket_inet(fd, family, type, listening, port)` | Like above, plus specific port number |
+| `sd_is_socket_unix(fd, type, listening, path, length)` | Unix socket at a specific path |
+| `sd_is_fifo(fd, path)` | Named pipe at a specific path |
+
+### Named descriptors
+
+When multiple socket units activate the same service, use `sd_listen_fds_with_names()` to retrieve names assigned via `FileDescriptorName=`:
+
+```c
+char **names = NULL;
+int n = sd_listen_fds_with_names(0, &names);
+
+for (int i = 0; i < n; i++) {
+    int fd = SD_LISTEN_FDS_START + i;
+    printf("fd %d is named: %s\n", fd, names[i]);
+}
+
+// Free the array after use
+for (int i = 0; i < n; i++)
+    free(names[i]);
+free(names);
+```
+
+## Socket unit files
+
+A `.socket` unit describes the socket to open. It is paired with a `.service` unit of the same base name.
+
+### TCP stream socket
+
+```ini /etc/systemd/system/myapp.socket
+[Unit]
+Description=My Application Socket
+
+[Socket]
+ListenStream=8080
+
+[Install]
+WantedBy=sockets.target
+```
+
+### Unix domain socket
+
+```ini /etc/systemd/system/myapp.socket
+[Unit]
+Description=My Application Unix Socket
+
+[Socket]
+ListenStream=/run/myapp/myapp.sock
+SocketUser=myapp
+SocketGroup=myapp
+SocketMode=0660
+
+[Install]
+WantedBy=sockets.target
+```
+
+### Multiple listen addresses
+
+```ini /etc/systemd/system/myapp.socket
+[Unit]
+Description=My Application — IPv4 and IPv6
+
+[Socket]
+ListenStream=0.0.0.0:8080
+ListenStream=[::]:8080
+BindIPv6Only=ipv6-only
+FileDescriptorName=http
+
+[Install]
+WantedBy=sockets.target
+```
+
+### Socket type options
+
+| Directive | Socket type | Use case |
+|---|---|---|
+| `ListenStream=` | `SOCK_STREAM` (TCP or Unix) | Connection-oriented services |
+| `ListenDatagram=` | `SOCK_DGRAM` (UDP or Unix) | Connectionless protocols |
+| `ListenSequentialPacket=` | `SOCK_SEQPACKET` | Ordered, connection-oriented Unix sockets |
+| `ListenFIFO=` | Named pipe | Legacy IPC |
+
+### Pairing with a service
+
+The socket unit activates the service unit with the same base name automatically. You can also use `Service=` to override the default:
+
+```ini /etc/systemd/system/myapp.socket
+[Socket]
+ListenStream=8080
+Service=myapp-handler.service
+```
+
+In the service unit, declare that it accepts the socket:
+
+```ini /etc/systemd/system/myapp.service
+[Unit]
+Description=My Application
+Requires=myapp.socket
+After=myapp.socket
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/myapp
+```
+
+<Tip>
+The `Requires=` and `After=` dependencies on the socket unit are added automatically for socket-activated services. You only need to write them explicitly if you need to vary the dependency type.
+</Tip>
+
+## Complete example: an echo server
+
+This service accepts connections on port 3000 and echoes data back. It is socket-activated: the socket is opened by systemd, and the service starts on first connection.
+
+```ini /etc/systemd/system/echo.socket
+[Unit]
+Description=Echo Server Socket
+
+[Socket]
+ListenStream=3000
+
+[Install]
+WantedBy=sockets.target
+```
+
+```ini /etc/systemd/system/echo.service
+[Unit]
+Description=Echo Server
+After=echo.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/echo-server
+```
+
+```c echo-server.c
+#include <systemd/sd-daemon.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(void) {
+    int n = sd_listen_fds(0);
+    if (n <= 0) {
+        fprintf(stderr, "No socket passed; expected socket activation\n");
+        return EXIT_FAILURE;
+    }
+
+    // Accept on the first passed fd (fd 3)
+    int listen_fd = SD_LISTEN_FDS_START;
+    char buf[4096];
+
+    int conn = accept(listen_fd, NULL, NULL);
+    if (conn < 0) {
+        perror("accept");
+        return EXIT_FAILURE;
+    }
+
+    ssize_t n_read;
+    while ((n_read = read(conn, buf, sizeof(buf))) > 0)
+        write(conn, buf, n_read);
+
+    close(conn);
+    return EXIT_SUCCESS;
+}
+```
+
+```bash
+# Start only the socket; the service starts on first connection
+sudo systemctl start echo.socket
+sudo systemctl enable echo.socket
+
+# Test it
+echo "hello" | nc localhost 3000
+```
+
+## nginx example
+
+nginx has built-in support for receiving pre-opened sockets via the `NGINX` environment variable:
+
+```ini /etc/systemd/system/nginx.socket
+[Socket]
+ListenStream=80
+ListenStream=0.0.0.0:80
+BindIPv6Only=ipv6-only
+
+[Install]
+WantedBy=sockets.target
+```
+
+```ini /etc/systemd/system/nginx.service
+[Service]
+User=nginx
+Group=nginx
+Environment=NGINX=3:4;
+ExecStart=/usr/sbin/nginx -c /etc/nginx/nginx.conf
+```
+
+## Testing without systemd
+
+Use `systemd-socket-activate` to test a socket-activated service from the command line without deploying it as a unit:
+
+```bash
+# Listen on port 8080, launch myapp when a connection arrives
+systemd-socket-activate -l 8080 /usr/bin/myapp
+
+# Listen on a Unix socket
+systemd-socket-activate -l /tmp/myapp.sock /usr/bin/myapp
+
+# Listen on a datagram (UDP) socket
+systemd-socket-activate --datagram -l 514 /usr/bin/myapp
+
+# Spawn a new instance per connection
+systemd-socket-activate --accept -l 8080 /usr/bin/myapp
+```
+
+`systemd-socket-activate` sets `LISTEN_FDS`, `LISTEN_PID`, and `LISTEN_FDNAMES` in the environment of the launched process, exactly as systemd would.
+
+## File descriptor store (FDSTORE)
+
+The file descriptor store lets a service hand open file descriptors back to systemd so they survive a service restart. This enables zero-downtime restarts without socket activation.
+
+Enable the store in the unit:
+
+```ini
+[Service]
+FileDescriptorStoreMax=16
+```
+
+Store an fd before restarting:
+
+```c
+// Store fd in the service manager under the name "myconn"
+sd_pid_notify_with_fds(0, 0, "FDSTORE=1\nFDNAME=myconn", &fd, 1);
+```
+
+On the next start, the service receives the stored descriptors through `sd_listen_fds()` alongside any socket-activated ones. Use `sd_listen_fds_with_names()` to tell them apart by name.
+
+<Note>
+File descriptors in the store are closed when the service is stopped (not restarted), unless `FileDescriptorStorePreserve=` is set in the unit.
+</Note>

@@ -1,0 +1,242 @@
+---
+title: 'Service sandboxing'
+description: 'Restrict what a systemd service can see and do using kernel namespaces, capabilities, and seccomp filters.'
+---
+
+System services run with broad access to the host by default. Sandboxing narrows that access so a compromised service cannot read secrets from other services, escalate privileges, or damage the wider system. systemd exposes these restrictions directly in unit files — no external tooling required.
+
+<Note>
+  Most sandboxing directives are available in the `[Service]` section of `.service` unit files. They work by manipulating Linux kernel namespaces, capabilities, and seccomp filters at process spawn time.
+</Note>
+
+## Filesystem isolation
+
+### PrivateTmp=
+
+```ini
+PrivateTmp=yes
+```
+
+Gives the service a private, empty `/tmp` and `/var/tmp` backed by a new mount namespace. Files written there are invisible to every other service and are cleaned up when the service stops. This prevents temp-file races and information leaks between services.
+
+### ProtectSystem=
+
+```ini
+ProtectSystem=strict
+```
+
+Controls how much of the host filesystem tree is write-protected inside the service:
+
+| Value | Effect |
+|---|---|
+| `yes` | Mount `/usr` and `/boot` read-only |
+| `full` | Also mount `/etc` read-only |
+| `strict` | Mount the entire filesystem tree read-only, except for `/dev`, `/proc`, `/sys`, and paths explicitly listed in `ReadWritePaths=` |
+
+Use `strict` for new services whenever possible.
+
+### ProtectHome=
+
+```ini
+ProtectHome=yes
+```
+
+Makes `/home`, `/root`, and `/run/user` inaccessible or empty inside the service. Accepted values:
+
+| Value | Effect |
+|---|---|
+| `yes` | The directories appear empty |
+| `read-only` | The directories are visible but read-only |
+| `tmpfs` | A temporary empty filesystem is mounted over them |
+
+### ReadWritePaths=, ReadOnlyPaths=, InaccessiblePaths=
+
+Fine-grained path access control layered on top of `ProtectSystem=`:
+
+```ini
+ReadWritePaths=/var/lib/myservice
+ReadOnlyPaths=/etc/myservice
+InaccessiblePaths=/etc/ssl/private
+```
+
+- `ReadWritePaths=` — paths the service may write to (grants write access even under `ProtectSystem=strict`)
+- `ReadOnlyPaths=` — paths visible but immutable
+- `InaccessiblePaths=` — paths the service cannot open at all, even if it runs as root
+
+Multiple paths can be listed space-separated on one line or across multiple assignments.
+
+### PrivateDevices=
+
+```ini
+PrivateDevices=yes
+```
+
+Replaces `/dev` with a minimal private namespace containing only `null`, `zero`, `full`, `random`, `urandom`, and `tty`. Raw block and character devices — including direct disk access — are removed, and the `CAP_MKNOD` capability is stripped automatically.
+
+## Network isolation
+
+### PrivateNetwork=
+
+```ini
+PrivateNetwork=yes
+```
+
+Places the service in a new, empty network namespace. It has only a loopback interface and cannot open any external network connections. Use this for services that only read from disk or communicate via Unix domain sockets.
+
+## User and privilege management
+
+### User=, Group=
+
+```ini
+User=myservice
+Group=myservice
+```
+
+Run the service process as a non-root user and group. This is the most fundamental privilege reduction: a process that starts without root cannot gain it (barring other vulnerabilities).
+
+### DynamicUser=
+
+```ini
+DynamicUser=yes
+```
+
+Allocates a transient, unprivileged UID/GID from the range 61184–65519 at service startup and releases it on stop. The user never appears in `/etc/passwd`. Combined with `StateDirectory=`, `CacheDirectory=`, and `LogsDirectory=`, it ensures persistent data is owned correctly without manual user creation.
+
+```ini
+[Service]
+DynamicUser=yes
+StateDirectory=myservice
+```
+
+### NoNewPrivileges=
+
+```ini
+NoNewPrivileges=yes
+```
+
+Sets the `PR_SET_NO_NEW_PRIVS` prctl flag. After this point, the process and all its children can never gain additional privileges through `execve()` — even if the target binary has the setuid bit set or has file capabilities. This is one of the most important sandboxing options.
+
+## Capability restrictions
+
+### CapabilityBoundingSet=
+
+```ini
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+```
+
+Limits the set of Linux capabilities the service can ever hold. Capabilities not listed here can never be acquired, even if the service runs as root. To remove all capabilities:
+
+```ini
+CapabilityBoundingSet=
+```
+
+Common capabilities to allow selectively:
+
+| Capability | Purpose |
+|---|---|
+| `CAP_NET_BIND_SERVICE` | Bind to ports below 1024 |
+| `CAP_NET_ADMIN` | Configure network interfaces |
+| `CAP_SYS_ADMIN` | Wide range of admin operations (avoid if possible) |
+| `CAP_CHOWN` | Change file ownership |
+| `CAP_DAC_OVERRIDE` | Bypass file read/write permission checks |
+
+## Syscall filtering
+
+### SystemCallFilter=
+
+```ini
+SystemCallFilter=@system-service
+```
+
+Installs a seccomp filter that allows or denies specific system calls. systemd provides named groups (prefixed with `@`) that bundle related syscalls:
+
+| Group | Contents |
+|---|---|
+| `@system-service` | Baseline set appropriate for most daemons |
+| `@network-io` | Socket, send, recv calls |
+| `@file-system` | open, read, write, close, stat, etc. |
+| `@process` | fork, exec, clone, wait |
+| `@basic-io` | read, write, seek, close |
+
+To allow only a minimal set and block everything else:
+
+```ini
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @obsolete
+```
+
+The `~` prefix denies the listed group. Denied syscalls cause the process to receive `SIGSYS` by default.
+
+## Hardened service example
+
+The following unit combines multiple sandboxing options for a typical stateless network service:
+
+```ini
+[Unit]
+Description=Hardened example service
+
+[Service]
+ExecStart=/usr/bin/myservice
+
+# Run as a dynamic unprivileged user
+DynamicUser=yes
+
+# Filesystem restrictions
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/myservice
+PrivateTmp=yes
+PrivateDevices=yes
+
+# Network
+# Remove this line if the service needs network access
+# PrivateNetwork=yes
+
+# Privilege restrictions
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Syscall filter
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
+```
+
+<Tip>
+  Start with `ProtectSystem=strict`, `ProtectHome=yes`, `NoNewPrivileges=yes`, and `DynamicUser=yes`. Then add back only what the service actually needs.
+</Tip>
+
+## Checking the sandbox score
+
+`systemd-analyze security` scores each service against a set of sandboxing criteria and reports which protections are missing:
+
+```bash
+systemd-analyze security myservice.service
+```
+
+Example output:
+
+```
+  NAME                                                        DESCRIPTION                              EXPOSURE
+✗ SupplementaryGroups=                                        Service runs with supplementary groups    0.1
+✗ CapabilityBoundingSet=~CAP_(CHOWN|FSETID|SETFCAP)         Capability set not restricted             0.3
+✓ NoNewPrivileges=                                            Service cannot gain new privileges        ---
+✓ ProtectSystem=                                             Service has strict system protections      ---
+…
+
+→ Overall exposure level for myservice.service: 2.3 OK 🙂
+```
+
+The overall exposure level runs from 0 (fully locked down) to 10 (fully exposed). Scores below 4 are considered acceptable for most services.
+
+```bash
+# Compare all running services at once
+systemd-analyze security
+```
+
+<Note>
+  A low exposure score does not guarantee security. It reflects only which knobs are turned on, not whether they are correctly configured for the service's actual behaviour.
+</Note>

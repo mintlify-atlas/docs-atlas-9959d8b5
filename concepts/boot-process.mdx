@@ -1,0 +1,192 @@
+---
+title: "Boot process"
+description: "Understand how systemd boots a Linux system: from firmware through initrd to user space, target ordering, parallel startup, and boot time analysis."
+---
+
+systemd takes over from the bootloader as PID 1 and orchestrates the entire user-space startup. It reads unit files, resolves dependencies, and starts units in parallel as soon as their dependencies are satisfied.
+
+## Boot stages
+
+The Linux boot process passes through several distinct phases before the system reaches a usable state.
+
+<Steps>
+  <Step title="Firmware">
+    The CPU executes firmware (UEFI or BIOS) stored in flash memory. The firmware initializes hardware, runs POST (Power-On Self Test), and selects a boot device.
+
+    On UEFI systems, the firmware reads the EFI System Partition (ESP) and launches the configured EFI application.
+  </Step>
+  <Step title="Bootloader">
+    The bootloader (commonly `systemd-boot` or GRUB) loads the kernel image and optionally an initial ramdisk (initrd) into memory, then transfers control to the kernel.
+
+    `systemd-boot` reads simple configuration files from the ESP at `/boot/loader/entries/*.conf`. It presents a menu (if configured) and passes the kernel command line to the kernel.
+
+    ```ini
+    # /boot/loader/entries/6a9857a-3.8.0-2.fc19.x86_64.conf
+    title      Fedora 19
+    linux      /6a9857a/3.8.0-2.fc19.x86_64/linux
+    initrd     /6a9857a/3.8.0-2.fc19.x86_64/initrd
+    options    root=UUID=f8f83f73-df71-445c-87f7-31f70263b83b quiet
+    ```
+  </Step>
+  <Step title="Kernel initialization">
+    The kernel decompresses itself, initializes memory management, sets up device drivers, and mounts the initrd as a temporary root file system.
+
+    The kernel starts the first user-space process, PID 1, from the initrd.
+  </Step>
+  <Step title="initrd (initial ramdisk)">
+    The initrd contains a minimal systemd instance that runs `initrd.target`. Its job is to locate and mount the real root file system, handle full-disk encryption (via `cryptsetup`), assemble software RAID arrays, and pivot to the real root.
+
+    Key initrd targets in order:
+    - `initrd-root-device.target` — the root block device is available
+    - `initrd-root-fs.target` — the root file system is mounted at `/sysroot`
+    - `initrd-fs.target` — other required file systems are mounted
+    - `initrd-switch-root.target` — pivot to the real root and exec the final systemd
+
+    After the pivot, the initrd's systemd hands off to the system's PID 1 at `/sbin/init`.
+  </Step>
+  <Step title="PID 1 — system manager">
+    The system's systemd runs as PID 1. It reads unit files from `/usr/lib/systemd/system/` and `/etc/systemd/system/`, resolves the dependency graph, and starts `default.target` (which is a symlink to either `multi-user.target` or `graphical.target`).
+
+    systemd activates units in parallel whenever their ordering dependencies permit.
+  </Step>
+  <Step title="User space">
+    Once `multi-user.target` or `graphical.target` is reached, the system is operational. Login managers, desktop environments, and background services are all running. For graphical sessions, `systemd-logind` and a display manager like `gdm` or `sddm` handle user sessions.
+  </Step>
+</Steps>
+
+## Target ordering during boot
+
+systemd reaches each target in sequence, though within each stage many units start in parallel.
+
+```
+sysinit.target
+      │
+      ▼
+basic.target
+      │
+      ├──────────────────────┐
+      ▼                      ▼
+multi-user.target    (other services)
+      │
+      ▼
+graphical.target
+```
+
+### sysinit.target
+
+The first major target. Reached after:
+
+- API virtual file systems are mounted (`/proc`, `/sys`, `/dev`, `/run`)
+- The hostname is set
+- Kernel modules are loaded (`systemd-modules-load.service`)
+- The system clock is initialized
+- `fsck` is run on all relevant file systems
+- Swap is activated
+- Temporary files and directories are set up (`systemd-tmpfiles-setup-dev.service`)
+
+### basic.target
+
+Extends `sysinit.target`. Reached after:
+
+- All configured socket units are set up (`sockets.target`)
+- All configured path units are set up (`paths.target`)
+- All configured timer units are loaded (`timers.target`)
+
+Most services declare `After=basic.target` (implicitly, via `DefaultDependencies=yes`) to ensure this baseline is available before they start.
+
+### multi-user.target
+
+The standard multi-user environment. All system services that should run on a server belong here. Services declare `WantedBy=multi-user.target` in their `[Install]` section to be pulled in at this stage.
+
+### graphical.target
+
+Extends `multi-user.target` with display manager services (such as `gdm.service` or `sddm.service`) that provide a graphical login screen.
+
+## How units are ordered and pulled in
+
+Ordering and dependency directives work together to sequence the boot.
+
+```ini
+[Unit]
+Description=PostgreSQL Database Server
+After=network.target
+Wants=network.target
+```
+
+- `After=network.target` ensures this service does not start until `network.target` has been reached, even if the service is activated at the same time.
+- `Wants=network.target` pulls `network.target` into the transaction so it is started as a dependency — but if `network.target` fails, this service still attempts to start.
+
+Use `Requires=` in place of `Wants=` when the dependency is mandatory: if the required unit fails, this unit also fails.
+
+<Note>
+`After=` and `Before=` are purely ordering constraints. They do not add a dependency. A unit with only `After=foo.service` set will only be ordered after `foo.service` if both units happen to be started in the same transaction.
+</Note>
+
+## Generators
+
+Generators are short-lived programs that systemd runs at startup (and after `daemon-reload`) to dynamically generate unit files. They run from directories like `/usr/lib/systemd/system-generators/` and write synthesized unit files to `/run/systemd/generator/`.
+
+Common generators:
+
+| Generator | Purpose |
+|-----------|---------|
+| `systemd-fstab-generator` | Creates mount and swap units from `/etc/fstab`. |
+| `systemd-gpt-auto-generator` | Discovers and mounts partitions based on GPT partition type GUIDs. |
+| `systemd-cryptsetup-generator` | Creates `systemd-cryptsetup@.service` units from `/etc/crypttab`. |
+| `systemd-rc-local-generator` | Provides compatibility with `/etc/rc.local`. |
+
+Generators allow systemd to integrate with static configuration files without requiring those files to be in unit file format.
+
+## Parallel startup model
+
+systemd builds a dependency graph from all unit files and starts units concurrently whenever their ordering constraints allow. This is the primary reason systemd boots faster than traditional sequential init systems.
+
+When systemd starts a unit:
+1. It checks that all `After=` dependencies have already reached their active state.
+2. It checks that all `Requires=` and `Wants=` dependencies are either active or being activated.
+3. It spawns the service process via `posix_spawn()` through the `systemd-executor` helper binary.
+
+Because socket units are set up before their associated service units (via `sockets.target`), services that depend on each other's sockets can start in parallel — each waits at the socket level for the peer to respond rather than blocking other startup work.
+
+## Analyzing boot times
+
+Use `systemd-analyze` to measure and understand boot performance.
+
+```bash
+# Total boot time breakdown
+systemd-analyze
+
+# Per-unit startup times, sorted slowest first
+systemd-analyze blame
+
+# Generate an SVG timeline of the entire boot
+systemd-analyze plot > boot.svg
+
+# Show the critical path (the longest chain of sequential dependencies)
+systemd-analyze critical-chain
+
+# Show the critical chain for a specific unit
+systemd-analyze critical-chain postgresql.service
+```
+
+Example output of `systemd-analyze`:
+
+```
+Startup finished in 1.753s (firmware) + 1.204s (loader) + 1.471s (kernel) + 2.338s (initrd) + 8.215s (userspace) = 14.983s
+graphical.target reached after 8.190s in userspace.
+```
+
+Example output of `systemd-analyze blame`:
+
+```
+3.421s NetworkManager-wait-online.service
+2.913s plymouth-quit-wait.service
+1.204s dev-sda3.device
+ 887ms systemd-udev-settle.service
+ 541ms systemd-journald.service
+ 401ms systemd-resolved.service
+```
+
+<Tip>
+`systemd-analyze critical-chain` shows the longest sequential chain of dependencies that determines the minimum possible boot time. Units on this chain are the most effective targets for boot optimization.
+</Tip>

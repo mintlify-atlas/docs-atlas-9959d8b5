@@ -1,0 +1,295 @@
+---
+title: "Debugging systemd services"
+description: "Diagnose boot problems, service failures, and runtime issues using systemd-analyze, journalctl, and related tools."
+---
+
+Debugging systemd starts with identifying whether a problem occurs before or after systemd takes control of the boot process. Once you have a shell—even a rescue or emergency shell—most issues can be diagnosed using the tools described on this page.
+
+## Analyzing boot performance
+
+`systemd-analyze` inspects startup timing and unit dependencies. Use it after a successful boot to identify bottlenecks.
+
+<Steps>
+  <Step title="Show total boot time">
+    ```bash
+    systemd-analyze time
+    ```
+    Outputs the time spent in firmware, the bootloader, the kernel, and userspace (initrd + userspace).
+  </Step>
+  <Step title="List units by activation time">
+    ```bash
+    systemd-analyze blame
+    ```
+    Lists each unit sorted by the time it took to initialize, longest first.
+  </Step>
+  <Step title="Show the critical chain">
+    ```bash
+    systemd-analyze critical-chain
+    systemd-analyze critical-chain <unit>
+    ```
+    Prints the chain of units that determined the total boot time. Optionally pass a specific unit to trace its chain.
+  </Step>
+  <Step title="Generate an SVG boot chart">
+    ```bash
+    systemd-analyze plot > boot.svg
+    ```
+    Produces a timeline chart of all units across the boot. Open the SVG in a browser for an interactive view.
+  </Step>
+</Steps>
+
+### Validating and auditing unit files
+
+<CardGroup cols={2}>
+  <Card title="Verify unit files" icon="circle-check">
+    ```bash
+    systemd-analyze verify myservice.service
+    ```
+    Checks unit files for syntax errors and dependency issues without applying them to the running system. Useful when writing new unit files locally before deploying.
+  </Card>
+  <Card title="Security scoring" icon="shield">
+    ```bash
+    systemd-analyze security myservice.service
+    ```
+    Scores the sandboxing posture of a service and lists which security options are missing (e.g., `PrivateTmp=`, `NoNewPrivileges=`).
+  </Card>
+</CardGroup>
+
+---
+
+## Checking service status and properties
+
+```bash
+systemctl status myservice.service
+```
+
+The output includes the load state, active state, exit code, PID, recent journal lines, and cgroup membership. Run as root or a member of the `adm` group to see journal lines inline.
+
+To inspect every low-level property of a unit, use `show`:
+
+```bash
+systemctl show myservice.service
+systemctl show myservice.service --property=ExecStart,Restart
+```
+
+---
+
+## Reading logs with journalctl
+
+<Tabs>
+  <Tab title="By unit">
+    ```bash
+    journalctl -u myservice.service
+    journalctl -u myservice.service -f        # follow live
+    journalctl -u myservice.service -n 50     # last 50 lines
+    ```
+  </Tab>
+  <Tab title="Current boot">
+    ```bash
+    journalctl -b          # all messages from current boot
+    journalctl -b -1       # messages from the previous boot
+    journalctl -b -k       # kernel messages only (dmesg equivalent)
+    ```
+  </Tab>
+  <Tab title="By priority">
+    ```bash
+    journalctl -p err      # errors and above
+    journalctl -p warning  # warnings and above
+    journalctl -p debug    # everything including debug
+    ```
+  </Tab>
+  <Tab title="For a bug report">
+    ```bash
+    journalctl -b > journal.txt
+    ```
+    Capture the full journal from the current boot and attach it to a bug report. Do not truncate the output.
+  </Tab>
+</Tabs>
+
+---
+
+## Common failure patterns
+
+<AccordionGroup>
+  <Accordion title="Service fails to start: ExecStart= not found or permission denied">
+    The status output will show `code=exited, status=203/EXEC` (executable not found) or `status=1/FAILURE` with a permission error in the log.
+
+    ```bash
+    systemctl status myservice.service
+    journalctl -u myservice.service -n 30
+    ```
+
+    Check that the binary specified in `ExecStart=` exists and is executable:
+
+    ```bash
+    ls -l /usr/local/bin/myservice
+    ```
+
+    If the unit uses `User=` or sandboxing options like `PrivateTmp=`, the binary must be accessible within those constraints.
+  </Accordion>
+
+  <Accordion title="Service killed by OOM killer">
+    The journal will contain a message from the kernel:
+
+    ```
+    kernel: Out of memory: Killed process 1234 (myservice) total-vm:...
+    ```
+
+    Check the unit's memory accounting and limits:
+
+    ```bash
+    systemctl show myservice.service --property=MemoryMax,MemoryHigh
+    ```
+
+    To set a limit and receive a structured notification instead of a hard kill, configure `MemoryMax=` in the unit file and optionally `OOMPolicy=stop`.
+  </Accordion>
+
+  <Accordion title="Service timeout exceeded">
+    systemd kills services that take too long to start, stop, or reload. The journal will show:
+
+    ```
+    myservice.service: start operation timed out. Terminating.
+    ```
+
+    The default `TimeoutStartSec=` is 90 seconds. To diagnose, temporarily increase the timeout:
+
+    ```ini
+    [Service]
+    TimeoutStartSec=300
+    ```
+
+    Then run the service manually to observe the delay:
+
+    ```bash
+    systemd-run --unit=test-myservice /usr/local/bin/myservice
+    journalctl -u test-myservice -f
+    ```
+  </Accordion>
+
+  <Accordion title="Dependency cycle">
+    If systemd detects a circular dependency it will log:
+
+    ```
+    Found ordering cycle on myservice.service
+    Breaking ordering cycle by deleting job ...
+    ```
+
+    Use `systemd-analyze` to trace the cycle:
+
+    ```bash
+    systemd-analyze critical-chain myservice.service
+    systemd-analyze dot myservice.service | dot -Tsvg > deps.svg
+    ```
+
+    Look for `After=`/`Before=` or `Wants=`/`Requires=` pairs that form a loop, and remove the conflicting direction.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Enabling debug logging
+
+### systemd log level at runtime
+
+To increase verbosity for a single service without restarting it:
+
+```bash
+SYSTEMD_LOG_LEVEL=debug myservice
+```
+
+To raise systemd's own log level (PID 1) at boot, add this to the kernel command line:
+
+```bash
+systemd.log_level=debug systemd.log_target=kmsg log_buf_len=1M printk.devkmsg=on
+```
+
+This writes verbose systemd output to the kernel ring buffer, where it survives early failures and is accessible via `journalctl -b`.
+
+### Forwarding to a serial console
+
+If the system hangs before presenting a login prompt, redirect output to a serial console:
+
+```bash
+systemd.log_level=debug systemd.log_target=console console=ttyS0,38400 console=tty1
+```
+
+Or, if PID 1 starts successfully but a later service fails, forward journal output:
+
+```bash
+systemd.journald.forward_to_console=1 console=ttyS0,38400 console=tty1
+```
+
+---
+
+## Rescue and emergency mode
+
+<Steps>
+  <Step title="Boot into rescue mode">
+    Add `systemd.unit=rescue.target` or simply `1` to the kernel command line. Rescue mode starts basic services and gives you a root shell. Use it to disable a failing unit:
+
+    ```bash
+    systemctl disable myservice.service
+    ```
+  </Step>
+  <Step title="Boot into emergency mode">
+    Add `systemd.unit=emergency.target` or `emergency` to the kernel command line. The root filesystem is mounted read-only. To edit files:
+
+    ```bash
+    mount -o remount,rw /
+    ```
+
+    Common use: fix bad entries in `/etc/fstab`, then reload:
+
+    ```bash
+    systemctl daemon-reload
+    ```
+  </Step>
+  <Step title="Enable the early debug shell">
+    The debug shell provides a root shell on tty9 from very early in the boot sequence—before most services start—and stays active until late shutdown.
+
+    ```bash
+    systemctl enable debug-shell.service
+    ```
+
+    Or pass `systemd.debug_shell=1` on the kernel command line. Access it with **Ctrl+Alt+F9**.
+
+    <Warning>
+      Disable `debug-shell.service` as soon as you finish debugging. A permanently available root shell is a security risk.
+    </Warning>
+  </Step>
+</Steps>
+
+---
+
+## Testing unit files locally
+
+Use `SYSTEMD_UNIT_PATH` to point systemd tooling at a local directory containing unit files, without installing them system-wide:
+
+```bash
+export SYSTEMD_UNIT_PATH=/path/to/my/units:
+systemd-analyze verify myservice.service
+```
+
+The trailing colon appends the system unit paths so existing units are still resolvable.
+
+---
+
+## Running ad-hoc services with systemd-run
+
+`systemd-run` executes a command as a transient systemd unit. This lets you test a command under the same cgroup and sandboxing constraints as a real service:
+
+```bash
+# Run a command in a transient service unit
+systemd-run --unit=test-job /usr/local/bin/mycommand --arg
+
+# Run interactively (allocate a TTY)
+systemd-run --pty --unit=test-shell /bin/bash
+
+# Scope mode: wrap an already-running process
+systemd-run --scope --unit=test-scope -- /usr/local/bin/mycommand
+```
+
+After the command exits, inspect its logs:
+
+```bash
+journalctl -u test-job
+```

@@ -1,0 +1,358 @@
+---
+title: "sd-event: Event Loop"
+description: "Reference for sd-event, libsystemd's epoll-based event loop for asynchronous I/O, timers, signals, and process monitoring."
+---
+
+`sd-event` is part of [libsystemd](/api/libsystemd) and provides a generic event loop built on Linux `epoll(7)`. It supports I/O readiness, timer events, UNIX signal handling, child process monitoring, inotify events, and deferred callbacks. The event loop is designed to run one instance per thread, dispatching events strictly in priority order.
+
+```c
+#include <systemd/sd-event.h>
+```
+
+```bash
+pkg-config --cflags --libs libsystemd
+```
+
+## Event loop lifecycle
+
+### Creating an event loop
+
+<Tabs>
+  <Tab title="Default (shared per thread)">
+    ```c
+    int sd_event_default(sd_event **event);
+    ```
+
+    Returns the default event loop for the calling thread, allocating one if none exists yet. All calls from the same thread return the same object with an incremented reference count. Use this when multiple components in the same thread need to share a single event loop.
+
+    ```c
+    {
+        __attribute__((cleanup(sd_event_unrefp))) sd_event *event = NULL;
+        int r;
+
+        r = sd_event_default(&event);
+        if (r < 0) {
+            errno = -r;
+            fprintf(stderr, "Failed to allocate event loop: %m\n");
+        }
+        /* ... */
+    }
+    ```
+  </Tab>
+  <Tab title="Independent">
+    ```c
+    int sd_event_new(sd_event **event);
+    ```
+
+    Allocates a new, independent event loop object not associated with any thread. Drop the reference with `sd_event_unref()` when done.
+  </Tab>
+</Tabs>
+
+### Running the loop
+
+```c
+/* Run a single iteration; returns >0 if an event was dispatched, 0 if idle */
+int sd_event_run(sd_event *event, uint64_t timeout_usec);
+
+/* Run until sd_event_exit() is called; returns the exit code */
+int sd_event_loop(sd_event *event);
+
+/* Request the loop to exit */
+int sd_event_exit(sd_event *event, int code);
+```
+
+`sd_event_loop()` is the simplest way to run the loop indefinitely. Call `sd_event_exit()` from any callback to stop it.
+
+### Reference counting
+
+```c
+sd_event *sd_event_ref(sd_event *event);
+sd_event *sd_event_unref(sd_event *event);
+void      sd_event_unrefp(sd_event **event);  /* for cleanup attribute */
+```
+
+## Event sources
+
+Every event source is represented by an `sd_event_source *`. Sources can be enabled, disabled, or configured for one-shot delivery using `sd_event_source_set_enabled()`:
+
+```c
+int sd_event_source_set_enabled(sd_event_source *source, int enabled);
+```
+
+The `enabled` parameter takes one of:
+
+| Value | Meaning |
+|-------|---------|
+| `SD_EVENT_ON` | Source fires repeatedly whenever its condition is met |
+| `SD_EVENT_OFF` | Source is disabled; never fires |
+| `SD_EVENT_ONESHOT` | Source fires once, then is automatically disabled |
+
+### I/O readiness — sd_event_add_io()
+
+Monitors a file descriptor for I/O readiness using `epoll(7)`:
+
+```c
+typedef int (*sd_event_io_handler_t)(
+    sd_event_source *s,
+    int fd,
+    uint32_t revents,
+    void *userdata);
+
+int sd_event_add_io(
+    sd_event *event,
+    sd_event_source **source,
+    int fd,
+    uint32_t events,
+    sd_event_io_handler_t handler,
+    void *userdata);
+```
+
+The `events` bitmask uses the same flags as `epoll_ctl(2)`: `EPOLLIN`, `EPOLLOUT`, `EPOLLHUP`, `EPOLLERR`, `EPOLLET` (edge-triggered), and others.
+
+```c
+static int io_handler(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+    char buf[256];
+    ssize_t n;
+
+    if (revents & EPOLLIN) {
+        n = read(fd, buf, sizeof(buf));
+        if (n > 0)
+            printf("Read %zd bytes\n", n);
+    }
+    return 0;
+}
+
+/* Watch stdin for readability */
+sd_event_add_io(event, &source, STDIN_FILENO, EPOLLIN, io_handler, NULL);
+```
+
+### Timer events — sd_event_add_time()
+
+Adds a timer event source backed by `timerfd_create(2)`:
+
+```c
+typedef int (*sd_event_time_handler_t)(
+    sd_event_source *s,
+    uint64_t usec,
+    void *userdata);
+
+int sd_event_add_time(
+    sd_event *event,
+    sd_event_source **source,
+    clockid_t clock,
+    uint64_t usec,
+    uint64_t accuracy,
+    sd_event_time_handler_t handler,
+    void *userdata);
+
+/* Relative to the current time on the given clock */
+int sd_event_add_time_relative(
+    sd_event *event,
+    sd_event_source **source,
+    clockid_t clock,
+    uint64_t usec,
+    uint64_t accuracy,
+    sd_event_time_handler_t handler,
+    void *userdata);
+```
+
+**Supported clocks:**
+
+| Clock | Description |
+|-------|-------------|
+| `CLOCK_MONOTONIC` | Monotonic clock; does not go backwards; pauses during suspend |
+| `CLOCK_REALTIME` | Wall-clock time; can jump on NTP adjustments |
+| `CLOCK_BOOTTIME` | Like monotonic, but continues during suspend |
+| `CLOCK_REALTIME_ALARM` | Wall-clock; can wake system from suspend |
+| `CLOCK_BOOTTIME_ALARM` | Boot-relative; can wake system from suspend |
+
+The `accuracy` parameter (in microseconds) allows the kernel to coalesce timer events to reduce power consumption. Pass `0` for the highest available precision.
+
+```c
+static int timer_handler(sd_event_source *s, uint64_t usec, void *userdata) {
+    printf("Timer fired at %" PRIu64 " us\n", usec);
+    /* Re-arm for next second */
+    sd_event_source_set_time_relative(s, 1000000);
+    sd_event_source_set_enabled(s, SD_EVENT_ONESHOT);
+    return 0;
+}
+
+/* Fire once after 5 seconds on the monotonic clock */
+sd_event_add_time_relative(event, &source, CLOCK_MONOTONIC,
+                           5 * 1000000, 0,
+                           timer_handler, NULL);
+```
+
+### Signal handling — sd_event_add_signal()
+
+Adds a UNIX signal event source backed by `signalfd(2)`:
+
+```c
+int sd_event_add_signal(
+    sd_event *event,
+    sd_event_source **source,
+    int sig,
+    sd_event_signal_handler_t handler,
+    void *userdata);
+```
+
+The signal must be blocked in the calling thread before adding the source (typically with `sigprocmask()`). Full real-time signal support and queued signal parameters are available.
+
+```c
+/* Block SIGTERM so it is delivered via the event loop */
+sigset_t ss;
+sigemptyset(&ss);
+sigaddset(&ss, SIGTERM);
+sigprocmask(SIG_BLOCK, &ss, NULL);
+
+sd_event_add_signal(event, NULL, SIGTERM, signal_handler, NULL);
+```
+
+### Child process events — sd_event_add_child()
+
+Monitors child process state changes based on `waitid(2)`:
+
+```c
+int sd_event_add_child(
+    sd_event *event,
+    sd_event_source **source,
+    pid_t pid,
+    int options,
+    sd_event_child_handler_t handler,
+    void *userdata);
+```
+
+### Deferred and post callbacks
+
+<Steps>
+  <Step title="sd_event_add_defer()">
+    Registers a callback that fires in each event loop iteration, before waiting for I/O. Useful for processing pending work without blocking.
+  </Step>
+  <Step title="sd_event_add_post()">
+    Registers a callback that fires after each event source dispatch. Runs after the primary event handler of any source fires.
+  </Step>
+  <Step title="sd_event_add_exit()">
+    Registers a callback that fires when `sd_event_exit()` is called, before the loop returns. Useful for cleanup.
+  </Step>
+</Steps>
+
+## Event source priorities
+
+All event sources have a 64-bit priority value. Sources with smaller priority values (numerically lower) are dispatched first when multiple sources are simultaneously pending:
+
+```c
+int sd_event_source_set_priority(sd_event_source *source, int64_t priority);
+```
+
+Predefined priority constants: `SD_EVENT_PRIORITY_IMPORTANT` (-100), `SD_EVENT_PRIORITY_NORMAL` (0), `SD_EVENT_PRIORITY_IDLE` (100).
+
+## Watchdog integration
+
+The event loop can automatically send `sd_notify(0, "WATCHDOG=1")` keep-alive pings to the service manager:
+
+```c
+int sd_event_set_watchdog(sd_event *event, int b);
+```
+
+When enabled, the event loop reads `$WATCHDOG_USEC` and pings at half the required interval automatically.
+
+## Integration with sd-bus
+
+Attach an sd-bus connection to the event loop so that D-Bus I/O is handled alongside other event sources:
+
+```c
+int sd_bus_attach_event(sd_bus *bus, sd_event *event, int priority);
+```
+
+After attaching, a single `sd_event_loop()` call drives both D-Bus and all other registered sources.
+
+## Integration with foreign event loops
+
+`sd_event_get_fd()` returns an epoll file descriptor that represents the entire sd-event loop. This allows embedding sd-event into other event loop frameworks by watching that single file descriptor.
+
+**Example — integrating sd-event into GLib's main loop:**
+
+```c
+/* SPDX-License-Identifier: MIT-0 */
+#include <stdlib.h>
+#include <glib.h>
+#include <systemd/sd-event.h>
+
+typedef struct SDEventSource {
+    GSource source;
+    GPollFD pollfd;
+    sd_event *event;
+} SDEventSource;
+
+static gboolean event_prepare(GSource *source, gint *timeout_) {
+    return sd_event_prepare(((SDEventSource *)source)->event) > 0;
+}
+
+static gboolean event_check(GSource *source) {
+    return sd_event_wait(((SDEventSource *)source)->event, 0) > 0;
+}
+
+static gboolean event_dispatch(GSource *source, GSourceFunc callback,
+                               gpointer user_data) {
+    return sd_event_dispatch(((SDEventSource *)source)->event) > 0;
+}
+
+static void event_finalize(GSource *source) {
+    sd_event_unref(((SDEventSource *)source)->event);
+}
+
+static GSourceFuncs event_funcs = {
+    .prepare  = event_prepare,
+    .check    = event_check,
+    .dispatch = event_dispatch,
+    .finalize = event_finalize,
+};
+
+GSource *g_sd_event_create_source(sd_event *event) {
+    SDEventSource *source;
+
+    source = (SDEventSource *)g_source_new(&event_funcs, sizeof(SDEventSource));
+
+    source->event = sd_event_ref(event);
+    source->pollfd.fd = sd_event_get_fd(event);
+    source->pollfd.events = G_IO_IN | G_IO_HUP | G_IO_ERR;
+
+    g_source_add_poll((GSource *)source, &source->pollfd);
+
+    return (GSource *)source;
+}
+```
+
+This pattern works with any event loop that can watch a file descriptor: poll the fd returned by `sd_event_get_fd()`, then call `sd_event_prepare()`, `sd_event_wait()`, and `sd_event_dispatch()` in sequence as directed by the foreign loop.
+
+<Note>
+  The event loop design targets one instance per thread. It does not distribute events across multiple worker threads. Use separate event loop instances in separate threads if parallelism is needed.
+</Note>
+
+## Quick reference
+
+| Function | Description |
+|----------|-------------|
+| `sd_event_new(event)` | Allocate a new independent event loop |
+| `sd_event_default(event)` | Get the default per-thread event loop |
+| `sd_event_run(event, timeout)` | Single-iteration run |
+| `sd_event_loop(event)` | Run until exit |
+| `sd_event_exit(event, code)` | Request loop termination |
+| `sd_event_add_io(...)` | Watch a file descriptor for I/O |
+| `sd_event_add_time(...)` | Add a timer event |
+| `sd_event_add_time_relative(...)` | Add a timer relative to now |
+| `sd_event_add_signal(...)` | Handle a UNIX signal |
+| `sd_event_add_child(...)` | Monitor a child process |
+| `sd_event_add_defer(...)` | Deferred per-iteration callback |
+| `sd_event_add_post(...)` | Post-dispatch callback |
+| `sd_event_add_exit(...)` | Cleanup callback on exit |
+| `sd_event_source_set_enabled(...)` | Enable/disable/oneshot a source |
+| `sd_event_source_set_priority(...)` | Set dispatch priority |
+| `sd_event_get_fd(event)` | Get epoll fd for foreign loop integration |
+| `sd_event_set_watchdog(event, 1)` | Enable automatic watchdog pings |
+
+## See also
+
+- [sd-bus: D-Bus IPC Library](/api/sd-bus) — attach sd-bus to this event loop
+- [libsystemd Library](/api/libsystemd) — full libsystemd overview
+- [D-Bus Interface Overview](/api/dbus-overview) — the interfaces systemd exposes

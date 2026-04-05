@@ -1,0 +1,283 @@
+---
+title: 'Portable services'
+description: 'Bundle a service and its dependencies into a portable OS image that can be attached to and detached from any compatible host.'
+---
+
+A portable service is an OS file system tree — packaged as a directory or raw disk image — that contains service binaries, their dependencies, and systemd unit files. You attach the image to a host with `portablectl attach` and the units become available exactly like locally installed services. Detach it and no trace remains.
+
+## How portable services differ from containers
+
+Portable services are not containers. The distinction matters:
+
+| | Portable service | Container (e.g. Docker) |
+|---|---|---|
+| PID namespace | Shares host PID namespace | Isolated PID namespace (runs as PID 1) |
+| Init system | Not needed inside image | Often runs its own init |
+| Cgroups / logging | Fully integrated with host | Separate runtime required |
+| Network management | Host manages network | Container manages its own network |
+| Control | `systemctl start/stop` | `docker start/stop` |
+| Purpose | Extend the host with encapsulated services | Run isolated, self-contained environments |
+
+Portable services run as regular system processes managed by the host's service manager. They appear in `systemctl status`, log to the host journal, and participate in the host's cgroup hierarchy.
+
+<Note>
+  Portable services are only available for system services. They cannot be used for user services (the use-case covered by Flatpak or Bubblewrap).
+</Note>
+
+## Attaching and detaching
+
+### portablectl attach
+
+```bash
+portablectl attach foobar_0.7.23.raw
+```
+
+`attach` performs four steps:
+
+<Steps>
+  <Step title="Inspect the image">
+    Dissect the image, validate the `os-release` file, and enumerate all unit files inside.
+  </Step>
+  <Step title="Copy unit files to the host">
+    Unit files matching the image name prefix (`.service`, `.socket`, `.target`, `.timer`, `.path`) are copied to `/etc/systemd/system.attached/`, which is part of the normal unit file search path.
+  </Step>
+  <Step title="Create the RootImage= drop-in">
+    A drop-in file is added to each copied service unit containing:
+
+    ```ini
+    [Service]
+    RootImage=/path/to/foobar.raw
+    Environment=PORTABLE=foobar
+    LogExtraFields=PORTABLE=foobar
+    ```
+
+    This ensures the service binary runs from inside the image's filesystem.
+  </Step>
+  <Step title="Apply a security profile">
+    A second drop-in links in a security profile. The `default` profile is used unless you specify another with `--profile=`.
+  </Step>
+</Steps>
+
+By default, `attach` does not enable or start the units. Use `--enable` and `--now` to do so immediately:
+
+```bash
+portablectl attach --enable --now foobar_0.7.23.raw
+```
+
+### portablectl detach
+
+Remove all unit files and drop-ins associated with an image:
+
+```bash
+portablectl detach foobar_0.7.23.raw
+```
+
+This is the exact reverse of `attach`. Use `--enable` and `--now` to stop and disable the units first:
+
+```bash
+portablectl detach --enable --now foobar_0.7.23.raw
+```
+
+### portablectl reattach
+
+Upgrade a running portable service without a full stop/start cycle. `reattach` performs a `restart` on units rather than `stop` + `start`, preserving runtime state such as the file descriptor store:
+
+```bash
+portablectl reattach foobar_0.7.23.raw
+```
+
+### portablectl list
+
+List all portable service images discovered in the image search paths, along with their state (attached/detached) and brief metadata:
+
+```bash
+portablectl list
+```
+
+## Image format
+
+Portable service images are standard OS trees — no new image format or metadata is introduced.
+
+<Tabs>
+  <Tab title="Directory">
+    A plain directory (or btrfs subvolume) containing a Linux OS tree:
+
+    ```bash
+    /myservice/
+    ├── usr/
+    │   ├── bin/
+    │   │   └── myservice
+    │   └── lib/
+    │       └── systemd/
+    │           └── system/
+    │               └── myservice.service
+    ├── etc/
+    │   ├── os-release
+    │   ├── resolv.conf      # empty, bind-mounted from host at runtime
+    │   └── machine-id       # empty, bind-mounted from host at runtime
+    ├── proc/
+    ├── sys/
+    ├── dev/
+    ├── run/
+    ├── tmp/
+    └── var/
+        └── tmp/
+    ```
+  </Tab>
+  <Tab title="Raw disk image">
+    A regular file with the `.raw` suffix containing either:
+
+    - A single Linux filesystem (no partition table)
+    - An MBR/GPT disk image with one Linux partition
+    - A GPT image following the [Discoverable Partitions Specification](https://uapi-group.org/specifications/specs/discoverable_partitions_specification)
+
+    ```bash
+    foobar_0.7.23.raw
+    ```
+  </Tab>
+</Tabs>
+
+### Unit file placement
+
+Unit files inside the image are discovered at the standard locations relative to the image root:
+
+```
+/usr/lib/systemd/system/myservice.service   # preferred
+/etc/systemd/system/myservice.service       # also checked
+```
+
+The unit file name must start with the image's name prefix. For `foobar_0.7.23.raw`, the prefix is `foobar`. Valid unit names include:
+
+- `foobar.service`
+- `foobar-worker.service`
+- `foobar@.service`
+- `foobar.socket`
+
+### Image requirements
+
+For `portablectl attach` to succeed, an image must satisfy these requirements:
+
+<AccordionGroup>
+  <Accordion title="Executable and dependencies">
+    The image must contain the service binary and all libraries it links against, compiled for a compatible architecture.
+  </Accordion>
+  <Accordion title="At least one matching unit file">
+    The image must contain at least one unit file whose name starts with the derived prefix, in `/usr/lib/systemd/system/` or `/etc/systemd/system/`.
+  </Accordion>
+  <Accordion title="os-release file">
+    `/etc/os-release` or `/usr/lib/os-release` must exist and follow the standard format.
+  </Accordion>
+  <Accordion title="Bind-mount placeholders">
+    The files `/etc/resolv.conf` and `/etc/machine-id` must exist (may be empty). The directories `/proc/`, `/sys/`, `/dev/`, `/run/`, `/tmp/`, and `/var/tmp/` must exist as mount points.
+  </Accordion>
+</AccordionGroup>
+
+## Security profiles
+
+When attaching an image, `portablectl` links in a security profile drop-in that configures sandboxing for the service. Four profiles ship by default:
+
+<CardGroup cols={2}>
+  <Card title="default" icon="shield-halved">
+    Medium sandboxing. Mounts the image read-only via `ProtectSystem=strict`, provides access to the host D-Bus socket, `/etc/resolv.conf`, and the logging subsystem via `BindReadOnlyPaths=`. Suitable for most services.
+  </Card>
+  <Card title="strict" icon="shield">
+    Maximum sandboxing. Tightest available restrictions. Use for services that need minimal host access.
+  </Card>
+  <Card title="trusted" icon="circle-check">
+    No restrictions. Runs the service in the host filesystem root with full privileges. Use only for fully trusted, well-audited services.
+  </Card>
+  <Card title="nonetwork" icon="ban">
+    Same as `default` but with `PrivateNetwork=yes` to disable external network access.
+  </Card>
+</CardGroup>
+
+Specify a profile at attach time:
+
+```bash
+portablectl attach --profile=strict foobar_0.7.23.raw
+portablectl attach --profile=nonetwork foobar_0.7.23.raw
+```
+
+Administrators can define custom profiles by creating drop-in files in `/etc/systemd/portable/profiles/`.
+
+<Note>
+  All profiles except `trusted` set `ProtectSystem=strict`, making the image filesystem read-only at runtime. Use `StateDirectory=` in unit files to provide a writable data directory on the host for persistent service state.
+</Note>
+
+## Extension images
+
+Portable services can be composed from a base OS image plus one or more extension images layered on top with OverlayFS. This allows multiple services to share a common runtime (libraries, tools) without duplicating it in every image.
+
+```bash
+# Attach a service image on top of a Debian runtime base
+portablectl attach --extension foobar_0.7.23.raw debian-runtime_11.1.raw foobar
+
+# Extension can also be a directory
+portablectl attach --extension barbaz_7.0.23/ debian-runtime_11.1.raw barbaz
+```
+
+Extension image requirements:
+
+- The **base** image must contain an `os-release` file.
+- Each **extension** image must contain an `extension-release` file in `/usr/lib/extension-release.d/` with `ID=` and `SYSEXT_LEVEL=` or `VERSION_ID=` matching the base image.
+- The base image does not need to contain unit files; unit files come from the extension images.
+
+### Logging with extensions
+
+When extension images are in use, systemd automatically adds structured fields to journal entries:
+
+```
+PORTABLE=foobar_0.7.23.raw
+PORTABLE_ROOT=debian-runtime_11.1.raw
+PORTABLE_ROOT_NAME_AND_VERSION=debian_11
+PORTABLE_EXTENSION=foobar_0.7.23.raw
+PORTABLE_EXTENSION_NAME_AND_VERSION=foobar_0.7.23
+```
+
+## Creating portable service images with mkosi
+
+[mkosi](https://github.com/systemd/mkosi) is the recommended tool for building portable service images. It produces images that satisfy all requirements out of the box.
+
+```bash
+# Build a raw disk image
+mkosi build
+
+# Build an image that can also boot as a VM or container
+mkosi -b build
+```
+
+A single `mkosi`-built image with `-b` can be used as:
+
+1. A portable service attached with `portablectl attach`
+2. An OS container run with `systemd-nspawn -i image.raw -b`
+3. A VM image booted with QEMU/KVM
+4. A bare-metal install
+
+Other tools such as `debootstrap` and `dnf --installroot=` also produce compatible images without additional configuration.
+
+## Accessing host resources
+
+Services in portable images access host resources through normal unit file directives. The `default` profile already provides `BindReadOnlyPaths=` entries for `/etc/resolv.conf`, the D-Bus system bus socket, and the journal sockets.
+
+For additional host paths:
+
+```ini
+[Service]
+# Read-only access to a host configuration file
+BindReadOnlyPaths=/etc/myapp.conf
+
+# Read-write access to a host directory
+BindPaths=/var/lib/myservice-data
+```
+
+## Service instantiation
+
+Use standard systemd template units for running multiple instances of the same portable service:
+
+```bash
+portablectl attach foobar_0.7.23.raw
+systemctl enable --now foobar@instance-a.service
+systemctl enable --now foobar@instance-b.service
+```
+
+Include `foobar@.service` in the image alongside `foobar.service`. The `@` in the unit file name is recognized as a valid prefix separator by the attach logic.

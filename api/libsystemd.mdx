@@ -1,0 +1,185 @@
+---
+title: "libsystemd Library"
+description: "An overview of libsystemd, the C library for interfacing with systemd, covering its sub-libraries, linking, and service readiness notification."
+---
+
+`libsystemd` is the main C library for interfacing with systemd. It provides APIs for D-Bus IPC, an event loop, journal access, login session queries, device enumeration, and more. All sub-libraries are shipped as part of a single shared library and are accessed by including the corresponding header.
+
+## Linking
+
+Use `pkg-config` to get the correct compiler and linker flags:
+
+```bash
+pkg-config --cflags --libs libsystemd
+```
+
+Add `-lsystemd` to your build system. With Meson:
+
+```meson
+libsystemd = dependency('libsystemd')
+executable('myservice', 'main.c', dependencies: libsystemd)
+```
+
+The library maintains strict backwards-compatible API and ABI. Symbols are only ever added, never removed, and symbol versioning is used throughout.
+
+## Sub-libraries
+
+<AccordionGroup>
+  <Accordion title="sd-bus — D-Bus IPC">
+    **Header:** `#include <systemd/sd-bus.h>`
+
+    A full-featured D-Bus client and server library. Provides synchronous and asynchronous method calls, property access, signal subscription, and vtable-based object exposition. Used to communicate with the systemd service manager, logind, networkd, resolved, and other system services.
+
+    See [sd-bus: D-Bus IPC Library](/api/sd-bus) for detailed documentation.
+  </Accordion>
+  <Accordion title="sd-event — Event loop">
+    **Header:** `#include <systemd/sd-event.h>`
+
+    An `epoll(7)`-based event loop. Supports I/O readiness, timers (`CLOCK_MONOTONIC`, `CLOCK_REALTIME`, `CLOCK_BOOTTIME`), UNIX signals, child process state changes, inotify events, and deferred callbacks. Integrates with sd-bus via `sd_bus_attach_event()`.
+
+    See [sd-event: Event Loop](/api/sd-event) for detailed documentation.
+  </Accordion>
+  <Accordion title="sd-journal — Journal read/write">
+    **Header:** `#include <systemd/sd-journal.h>`
+
+    Provides APIs for writing structured log entries to the systemd journal and for reading journal entries from C programs. Supports filtering, seeking, and following the journal in real time.
+  </Accordion>
+  <Accordion title="sd-login — Login session queries">
+    **Header:** `#include <systemd/sd-login.h>`
+
+    Queries information about currently logged-in users, sessions, and seats. Useful for services that need to enumerate active sessions or determine whether a process belongs to a user session.
+  </Accordion>
+  <Accordion title="sd-id128 — 128-bit ID handling">
+    **Header:** `#include <systemd/sd-id128.h>`
+
+    Functions for generating and formatting 128-bit identifiers, including the machine ID, boot ID, and application-specific IDs derived from them. IDs are represented as `sd_id128_t` values.
+  </Accordion>
+  <Accordion title="sd-daemon — Service readiness notification">
+    **Header:** `#include <systemd/sd-daemon.h>`
+
+    The `sd_notify()` family of functions for notifying the service manager of state changes: startup completion, reloading, watchdog keep-alive pings, and shutdown. Also includes `sd_listen_fds()` for socket activation.
+  </Accordion>
+  <Accordion title="sd-device — udev device access">
+    **Header:** `#include <systemd/sd-device.h>`
+
+    Programmatic access to the udev device database. Enumerate devices, query device properties, and monitor for device events (plug/unplug). Replaces the older `libudev` API.
+  </Accordion>
+  <Accordion title="sd-hwdb — Hardware database">
+    **Header:** `#include <systemd/sd-hwdb.h>`
+
+    Read-only access to the udev hardware database (`hwdb`). Useful for looking up hardware properties by modalias.
+  </Accordion>
+  <Accordion title="sd-path — Well-known path lookups">
+    **Header:** `#include <systemd/sd-path.h>`
+
+    Returns the canonical paths for well-known filesystem locations such as temporary directories, configuration directories, and runtime state directories, respecting XDG base directory conventions.
+  </Accordion>
+  <Accordion title="sd-varlink — Varlink IPC">
+    **Header:** `#include <systemd/sd-varlink.h>`
+
+    APIs for implementing Varlink IPC clients and services. Varlink is a JSON-based IPC protocol used by several systemd components as an alternative to D-Bus for certain interfaces. Relies on `sd-json` for JSON serialization. The `varlinkctl` command-line tool provides interactive access.
+  </Accordion>
+</AccordionGroup>
+
+## Service readiness notification with sd_notify()
+
+Services notify the service manager of their lifecycle state using `sd_notify()`. The service must have `Type=notify` or `Type=notify-reload` set in its unit file, and `NotifyAccess=` must be configured appropriately.
+
+### Function signature
+
+```c
+#include <systemd/sd-daemon.h>
+
+int sd_notify(int unset_environment, const char *state);
+int sd_notifyf(int unset_environment, const char *format, …);
+```
+
+The `state` parameter is a newline-separated list of variable assignments. The `unset_environment` parameter, when non-zero, clears `$NOTIFY_SOCKET` after the call so that child processes cannot send notifications.
+
+### Well-known notification keys
+
+| Key | Meaning |
+|-----|---------|
+| `READY=1` | Service startup is complete (or reload is done) |
+| `RELOADING=1` | Service is beginning to reload its configuration |
+| `STOPPING=1` | Service is beginning its shutdown |
+| `STATUS=…` | A human-readable status string for `systemctl status` |
+| `WATCHDOG=1` | Watchdog keep-alive ping |
+| `WATCHDOG=trigger` | Service detected an internal error; trigger watchdog action |
+| `MAINPID=…` | Update the main PID known to the service manager |
+| `FDSTORE=1` | Store file descriptors in the service manager across restarts |
+| `ERRNO=…` | Report an errno-style error code on failure |
+
+### Examples
+
+**Minimal startup notification:**
+
+```c
+#include <systemd/sd-daemon.h>
+
+/* Call once initialization is complete */
+sd_notify(0, "READY=1");
+```
+
+**Extended notification with status and PID:**
+
+```c
+#include <sys/types.h>
+#include <unistd.h>
+#include <systemd/sd-daemon.h>
+
+sd_notifyf(0,
+           "READY=1\n"
+           "STATUS=Processing requests…\n"
+           "MAINPID=%lu",
+           (unsigned long) getpid());
+```
+
+**Error notification before exit:**
+
+```c
+sd_notifyf(0,
+           "STATUS=Failed to start up: %s\n"
+           "ERRNO=%i",
+           strerror_r(errnum, (char[1024]){}, 1024),
+           errnum);
+```
+
+**Watchdog keep-alive (call periodically at less than `WatchdogSec/2`):**
+
+```c
+sd_notify(0, "WATCHDOG=1");
+```
+
+**Synchronize notification delivery with `sd_notify_barrier()`:**
+
+```c
+sd_notify(0, "READY=1");
+/* Wait up to 5 seconds for the service manager to process the notification */
+sd_notify_barrier(0, 5 * 1000000);
+```
+
+<Note>
+  `sd_notify()` returns 0 if `$NOTIFY_SOCKET` is not set (the service is not supervised), and a positive value if the notification was enqueued. It is generally safe to ignore the return value; the function is a no-op when not supervised.
+</Note>
+
+## Including all headers
+
+```c
+#include <systemd/sd-bus.h>
+#include <systemd/sd-daemon.h>
+#include <systemd/sd-device.h>
+#include <systemd/sd-event.h>
+#include <systemd/sd-hwdb.h>
+#include <systemd/sd-id128.h>
+#include <systemd/sd-journal.h>
+#include <systemd/sd-login.h>
+#include <systemd/sd-path.h>
+#include <systemd/sd-varlink.h>
+```
+
+## See also
+
+- [D-Bus Interface Overview](/api/dbus-overview) — the D-Bus interfaces systemd exposes
+- [sd-bus: D-Bus IPC Library](/api/sd-bus) — D-Bus client/server API
+- [sd-event: Event Loop](/api/sd-event) — epoll-based event loop

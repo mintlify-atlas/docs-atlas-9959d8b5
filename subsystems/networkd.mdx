@@ -1,0 +1,282 @@
+---
+title: "systemd-networkd"
+description: "Network configuration daemon that manages link configuration, IP addressing, routing, and virtual network devices using declarative .network, .netdev, and .link files."
+---
+
+`systemd-networkd` is a system daemon that manages network configuration. It reads declarative configuration files and applies them to network interfaces as they appear, handling DHCP, static addressing, routing, and virtual device creation.
+
+Configuration files are read from `/etc/systemd/network/`, `/run/systemd/network/`, and `/usr/lib/systemd/network/`. Files are processed in alphanumeric order; prefix filenames with a number (e.g. `10-eth0.network`) to control precedence.
+
+---
+
+## .network files
+
+A `.network` file applies IP and routing configuration to a matched interface. The `[Match]` section selects which interface the file applies to; the first matching file wins.
+
+### DHCP configuration
+
+```ini
+# /etc/systemd/network/20-wired.network
+[Match]
+Name=eth0
+
+[Network]
+DHCP=yes
+```
+
+```ini
+# Match on a stable MAC address
+[Match]
+MACAddress=aa:bb:cc:dd:ee:ff
+
+[Network]
+DHCP=yes
+# Also enable IPv6 router advertisement processing
+IPv6AcceptRA=yes
+```
+
+### Static address configuration
+
+```ini
+# /etc/systemd/network/10-static.network
+[Match]
+Name=eth0
+
+[Network]
+Address=192.168.1.100/24
+Gateway=192.168.1.1
+DNS=9.9.9.9 1.1.1.1
+NTP=pool.ntp.org
+
+[Address]
+Address=192.168.1.101/24
+# Optional: keep address across reconfiguration
+KeepConfiguration=static
+
+[Route]
+Gateway=10.0.0.1
+Destination=10.0.0.0/8
+Metric=100
+```
+
+### Match directives
+
+The `[Match]` section supports multiple criteria. All specified criteria must match.
+
+```ini
+[Match]
+# Match by interface name (globs accepted)
+Name=en*
+
+# Match by driver
+Driver=virtio_net
+
+# Match by virtualization type
+Virtualization=kvm
+
+# Match by kernel command line option
+KernelCommandLine=my-option
+```
+
+<Note>
+  If a `.network` file has no valid `[Match]` entries, it matches all interfaces and `systemd-networkd` will log a warning. Use `Name=*` to explicitly match all interfaces.
+</Note>
+
+---
+
+## .netdev files — virtual devices
+
+`.netdev` files create virtual network devices: bridges, bonds, VLANs, VXLANs, and more.
+
+### Bridge
+
+```ini
+# /etc/systemd/network/10-bridge.netdev
+[NetDev]
+Name=br0
+Kind=bridge
+```
+
+```ini
+# /etc/systemd/network/10-bridge.network
+[Match]
+Name=br0
+
+[Network]
+DHCP=yes
+```
+
+```ini
+# /etc/systemd/network/20-eth0-bridge.network
+[Match]
+Name=eth0
+
+[Network]
+# Attach eth0 as a bridge slave
+Bridge=br0
+```
+
+### VLAN
+
+```ini
+# /etc/systemd/network/10-vlan100.netdev
+[NetDev]
+Name=vlan100
+Kind=vlan
+
+[VLAN]
+Id=100
+```
+
+```ini
+# /etc/systemd/network/20-eth0.network
+[Match]
+Name=eth0
+
+[Network]
+# Create the VLAN on top of eth0
+VLAN=vlan100
+```
+
+### Bond
+
+```ini
+# /etc/systemd/network/10-bond0.netdev
+[NetDev]
+Name=bond0
+Kind=bond
+
+[Bond]
+Mode=active-backup
+MIIMonitorSec=100ms
+```
+
+### VXLAN
+
+```ini
+# /etc/systemd/network/10-vxlan42.netdev
+[NetDev]
+Name=vxlan42
+Kind=vxlan
+
+[VXLAN]
+VNI=42
+Remote=192.168.0.1
+Local=192.168.0.10
+DestinationPort=4789
+```
+
+---
+
+## .link files — link configuration
+
+`.link` files apply low-level settings to interfaces matched by udev, including renaming, MTU, and driver parameters.
+
+```ini
+# /etc/systemd/network/10-web-server.link
+[Match]
+MACAddress=00:11:22:33:44:55
+
+[Link]
+# Assign a stable, descriptive name
+Name=lan0
+MTUBytes=9000
+WakeOnLan=magic
+```
+
+<Warning>
+  Link renaming happens early in the boot process via udev, before `systemd-networkd` runs. Changes to `.link` files require a reboot or `udevadm trigger` to take effect.
+</Warning>
+
+---
+
+## networkctl
+
+`networkctl` queries and controls the state of links as seen by `systemd-networkd`.
+
+<Steps>
+  <Step title="List all links">
+    ```bash
+    networkctl list
+    ```
+
+    Example output:
+
+    ```
+    IDX LINK         TYPE     OPERATIONAL SETUP
+      1 lo           loopback carrier     unmanaged
+      2 eth0         ether    routable    configured
+      3 br0          ether    routable    configured
+    ```
+  </Step>
+  <Step title="Inspect a link">
+    ```bash
+    networkctl status eth0
+    ```
+
+    Shows addresses, routes, DNS servers, DHCP lease details, and current operational state.
+  </Step>
+  <Step title="Bring a link up or down">
+    ```bash
+    networkctl up eth0
+    networkctl down eth0
+    ```
+  </Step>
+  <Step title="Reconfigure after file changes">
+    ```bash
+    # Reload configuration files without restarting the daemon
+    networkctl reload
+
+    # Reapply configuration to a specific link
+    networkctl reconfigure eth0
+    ```
+  </Step>
+</Steps>
+
+### Operational states
+
+| State | Meaning |
+|---|---|
+| `off` | Device is powered down |
+| `no-carrier` | Device is up but has no carrier signal |
+| `dormant` | Carrier is present but not ready for traffic |
+| `degraded` | Link has carrier and link-local addresses |
+| `routable` | Link has carrier and a routable address configured |
+| `enslaved` | Link is a slave in a bond or bridge |
+
+---
+
+## Network conditions with Match
+
+The `[Match]` section supports conditional logic to apply different configuration depending on environment:
+
+```ini
+# Apply only in a KVM virtual machine
+[Match]
+Name=eth0
+Virtualization=kvm
+
+[Network]
+DHCP=yes
+
+---
+
+# Apply only on bare metal
+[Match]
+Name=eth0
+Virtualization=no
+
+[Network]
+Address=10.0.0.5/24
+Gateway=10.0.0.1
+```
+
+```ini
+# Apply only when a specific kernel command-line option is present
+[Match]
+Name=eth0
+KernelCommandLine=custom-deploy
+
+[Network]
+Address=192.168.99.10/24
+```
